@@ -72,8 +72,45 @@ if not no_headers
 		'include/abi-bits/rlim_t.h',
 		'include/abi-bits/sigval.h',
 		'include/abi-bits/sigevent.h',
+		'include/twizzler/error.h',
+		'include/twizzler/types.h',
+		'include/twizzler/rt/alloc.h',
+		'include/twizzler/rt/core.h',
+		'include/twizzler/rt/debug.h',
+		'include/twizzler/rt/fd.h',
+		'include/twizzler/rt/handle.h',
+		'include/twizzler/rt/info.h',
+		'include/twizzler/rt/io.h',
+		'include/twizzler/rt/object.h',
+		'include/twizzler/rt/random.h',
+		'include/twizzler/rt/thread.h',
+		'include/twizzler/rt/time.h',
+		'include/twizzler/rt/types.h',
+		'include/twizzler/rt/version.h',
 		subdir: 'abi-bits',
 		follow_symlinks: true
+	)
+
+	install_headers(
+		'include/twizzler/error.h',
+		'include/twizzler/types.h',
+		subdir: 'twizzler',
+	)
+	install_headers(
+		'include/twizzler/rt/alloc.h',
+		'include/twizzler/rt/core.h',
+		'include/twizzler/rt/debug.h',
+		'include/twizzler/rt/fd.h',
+		'include/twizzler/rt/handle.h',
+		'include/twizzler/rt/info.h',
+		'include/twizzler/rt/io.h',
+		'include/twizzler/rt/object.h',
+		'include/twizzler/rt/random.h',
+		'include/twizzler/rt/thread.h',
+		'include/twizzler/rt/time.h',
+		'include/twizzler/rt/types.h',
+		'include/twizzler/rt/version.h',
+		subdir: 'twizzler/rt',
 	)
 endif
 
