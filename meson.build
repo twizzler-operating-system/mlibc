@@ -516,8 +516,8 @@ if not headers_only
 			cpp_args: static_cpp_args + ['-fno-stack-protector', libc_cpp_args],
 			include_directories: libc_include_dirs,
 			dependencies: libc_deps + rtlib_deps,
-			link_with: [ld_static_lib],
-			link_whole: [libc_sublibs, ld_static_lib],
+			link_with: [],
+			link_whole: [libc_sublibs],
 			install: true
 		)
 	endif

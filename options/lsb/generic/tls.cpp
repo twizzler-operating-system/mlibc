@@ -16,8 +16,8 @@
 		return __dlapi_get_tls(entry);
 	}
 #else
-	extern "C" void *__tls_get_addr(struct __abi_tls_entry *entry) {
-		return __dlapi_get_tls(entry);
-	}
+	//extern "C" void *__tls_get_addr(struct __abi_tls_entry *entry) {
+	//	return __dlapi_get_tls(entry);
+	//}
 #endif
 
