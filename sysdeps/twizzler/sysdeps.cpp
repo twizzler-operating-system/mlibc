@@ -13,6 +13,15 @@
 #include <mlibc/all-sysdeps.hpp>
 #include <limits.h>
 
+extern "C" {
+
+bool
+__aarch64_sme_accessible(void)
+{
+	return true;
+}
+}
+
 #define STUB_ONLY { __ensure(!"STUB_ONLY function was called"); __builtin_unreachable(); }
 #define UNUSED(x) (void)(x);
 
