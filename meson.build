@@ -426,15 +426,15 @@ if not no_headers
 endif
 
 rtld_sources += [
-	'options/internal/gcc/stack_protector.cpp',
-	'options/internal/gcc/guard-abi.cpp',
-	'options/internal/generic/allocator.cpp',
-	'options/internal/generic/debug.cpp',
-	'options/internal/generic/ensure.cpp',
-	'options/internal/generic/essential.cpp',
-	'options/internal/generic/inline-emitter.cpp',
-	'options/internal/generic/frigg.cpp',
-	'options/internal/generic/ubsan.cpp',
+	#'options/internal/gcc/stack_protector.cpp',
+	#'options/internal/gcc/guard-abi.cpp',
+	#'options/internal/generic/allocator.cpp',
+	#'options/internal/generic/debug.cpp',
+	#'options/internal/generic/ensure.cpp',
+	#'options/internal/generic/essential.cpp',
+	#'options/internal/generic/inline-emitter.cpp',
+	#'options/internal/generic/frigg.cpp',
+	#'options/internal/generic/ubsan.cpp',
 	'options/rtld/generic/main.cpp',
 	'options/rtld/generic/linker.cpp',
 	'options/rtld' / host_machine.cpu_family() / 'runtime.S'
@@ -496,6 +496,7 @@ if not headers_only
 		internal_sources,
 		ansi_sources,
 		lsb_sources,
+		rtld_sources
 	]
 
 	# Our library have different behaviour when built as static and shared libraries.

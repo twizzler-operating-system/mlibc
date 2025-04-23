@@ -13,7 +13,14 @@
 #include <mlibc/all-sysdeps.hpp>
 #include <limits.h>
 
+
 extern "C" {
+__attribute__((weak))
+void frg_panic(const char *mstr) {
+//	mlibc::sys_libc_log("mlibc: Call to frg_panic");
+	mlibc::sys_libc_log(mstr);
+	mlibc::sys_libc_panic();
+}
 
 bool
 __aarch64_sme_accessible(void)
@@ -457,15 +464,18 @@ void sys_exit(int status) {
 #define FUTEX_WAKE 1
 
 int sys_futex_tid() {
-	return -ENOSYS;
+	return 1;
+	//return -ENOSYS;
 }
 
 int sys_futex_wait(int *pointer, int expected, const struct timespec *time) {
-	return -ENOSYS;
+	return 0;
+	//return -ENOSYS;
 }
 
 int sys_futex_wake(int *pointer) {
-	return -ENOSYS;
+	return 0;
+	//return -ENOSYS;
 }
 
 int sys_mkdir(const char *path, mode_t mode) {
