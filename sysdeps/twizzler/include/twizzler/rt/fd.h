@@ -137,12 +137,12 @@ const fd_cmd FD_CMD_TRUNCATE = 2;
 /// the command specified.
 extern twz_error twz_rt_fd_cmd(descriptor fd, fd_cmd cmd, void *arg, void *ret);
 
-#define NAME_MAX 256
+#define NAME_ENTRY_LEN 256
 struct name_entry {
   struct fd_info info;
   uint32_t name_len;
   uint32_t linkname_len;
-  uint8_t name[NAME_MAX];
+  uint8_t name[NAME_ENTRY_LEN];
 };
 
 /// Enumerate sub-names in an fd (e.g. directory entries). The buf and len arguments form a &mut [name_entry] slice, and the off argument specifies how many names to skip for this read. The return value is the number of entries read, or

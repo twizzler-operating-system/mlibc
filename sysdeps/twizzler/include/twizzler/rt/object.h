@@ -26,6 +26,9 @@ const map_flags MAP_FLAG_PERSIST = 8;
 /// Allow the runtime to provide additional safety properties.
 const map_flags MAP_FLAG_INDIRECT = 16;
 
+/// Create a new runtime (volatile, tied to this runtime) object.
+extern struct objid_result twz_rt_create_rtobj(void);
+
 /// Map an object with a given ID and flags.
 extern struct map_result twz_rt_map_object(objid id, map_flags flags);
 /// Release an object handle. After calling this, the handle may not be used.

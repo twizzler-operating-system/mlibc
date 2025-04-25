@@ -23,6 +23,8 @@ struct option_duration {
   int32_t is_some;
 };
 
+const struct option_duration NO_DURATION = { .dur = {.seconds = 0, .nanos = 0}, .is_some = 0};
+
 #ifdef __cplusplus
 }
 #endif
