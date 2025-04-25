@@ -19,7 +19,7 @@ const twz_error ERROR_CATEGORY_SHIFT = 32;
 const twz_error_code SUCCESS = 0;
 
 // Generic
-const twz_error_code OTHER = 0;
+const twz_error_code OTHER_ERROR = 0;
 const twz_error_code NOT_SUPPORTED = 1;
 const twz_error_code INTERNAL = 2;
 const twz_error_code WOULD_BLOCK = 3;
@@ -56,7 +56,7 @@ const twz_error_code LINK_LOOP = 6;
 const twz_error_code NOT_EMPTY = 7;
 
 // Object
-const twz_error_code MAP_FAILED = 1;
+const twz_error_code MAPPING_FAILED = 1;
 const twz_error_code NOT_MAPPED = 2;
 const twz_error_code INVALID_FOTE = 3;
 const twz_error_code INVALID_PTR = 4;
