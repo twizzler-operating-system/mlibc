@@ -71,6 +71,13 @@ const twz_error_code DEVICE_ERROR = 3;
 const twz_error_code SEEK_FAILED = 4;
 const twz_error_code RESET = 5;
 
+// Security
+const twz_error_code INVALID_KEY = 1;
+const twz_error_code INVALID_SCHEME = 2;
+const twz_error_code SIGNATURE_MISMATCH = 3;
+const twz_error_code GATE_DENIED = 4;
+const twz_error_code INVALID_GATE = 5;
+
 // Kinds
 const twz_error_category UNCATEGORIZED_ERROR = 0;
 const twz_error_category GENERIC_ERROR = 1;
@@ -79,6 +86,7 @@ const twz_error_category RESOURCE_ERROR = 3;
 const twz_error_category NAMING_ERROR = 4;
 const twz_error_category OBJECT_ERROR = 5;
 const twz_error_category IO_ERROR = 6;
+const twz_error_category SECURITY_ERROR = 7;
 
 #ifdef __cplusplus
 }
