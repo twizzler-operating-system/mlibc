@@ -16,6 +16,7 @@
 #include <twizzler/rt/object.h>
 #include <twizzler/rt/fd.h>
 #include <twizzler/rt/io.h>
+#include <twizzler/rt/alloc.h>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
@@ -82,15 +83,11 @@ int sys_tcb_set(void *pointer) {
 }
 
 int sys_anon_allocate(size_t size, void **pointer) {
-	struct objid_result idr = twz_rt_create_rtobj();
-	if (idr.err != SUCCESS) {
-		return twz_error_errno(idr.err);
-	}
-	struct map_result mr = twz_rt_map_object(idr.val, MAP_FLAG_R | MAP_FLAG_W);
-	if (mr.error == SUCCESS) {
-		*pointer = (uint8_t *)mr.handle.start + 0x1000; // TODO
-	}
-	return twz_error_errno(mr.error);
+    *pointer = twz_rt_malloc(size, 128, ZERO_MEMORY);
+    if (*pointer == NULL) {
+        return -1;
+    }
+    return 0;
 }
 
 int sys_anon_free(void *pointer, size_t size) {
