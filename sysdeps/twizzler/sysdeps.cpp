@@ -1,3 +1,4 @@
+#include "include/twizzler/rt/info.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -455,7 +456,14 @@ int sys_getsockopt(int fd, int layer, int number, void *__restrict buffer, sockl
 }
 
 int sys_sysconf(int num, long *ret) {
+    struct system_info info = twz_rt_get_sysinfo();
 	switch(num) {
+    	case _SC_NPROCESSORS_CONF:
+            return info.available_parallelism;
+    	case _SC_NPROCESSORS_ONLN:
+    	    return info.available_parallelism;
+        case _SC_PAGESIZE:
+            return info.page_size;
 		default: {
 			return EINVAL;
 		}
