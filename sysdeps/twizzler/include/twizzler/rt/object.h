@@ -34,6 +34,9 @@ extern struct map_result twz_rt_map_object(objid id, map_flags flags);
 /// Release an object handle. After calling this, the handle may not be used.
 extern void twz_rt_release_handle(struct object_handle *handle);
 
+/// Update an object handle.
+extern twz_error twz_rt_update_handle(struct object_handle *handle);
+
 /// Given a pointer, find the start of the associated object. The returned pointer and the passed pointer p
 /// are guaranteed to be in the same object, allowing pointer arithmetic.
 extern void *twz_rt_locate_object_start(void *p);
@@ -44,10 +47,10 @@ extern struct object_handle twz_rt_get_object_handle(void *p);
 
 /// Resolve an FOT entry, returning an object handle for the target object with at least valid_len bytes of
 /// addressable memory.
-extern struct map_result twz_rt_resolve_fot(struct object_handle *handle, uint64_t idx, size_t valid_len);
+extern struct map_result twz_rt_resolve_fot(struct object_handle *handle, uint64_t idx, size_t valid_len, map_flags flags);
 /// Does the same as twz_rt_resolve_fot but optimizes for local pointers and avoids cloning handles if possible. Returns null on failure
 /// with no error code. Callers should try the twz_rt_resolve_fot function if this one fails.
-extern void *twz_rt_resolve_fot_local(void *start, uint64_t idx, size_t valid_len);
+extern void *twz_rt_resolve_fot_local(void *start, uint64_t idx, size_t valid_len, map_flags flags);
 
 /// Insert the given entry into the FOT, or return the existing entry if it already exists in this object's FOT.
 /// Returns -1 on failure.
