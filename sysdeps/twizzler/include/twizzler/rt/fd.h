@@ -11,6 +11,8 @@ typedef int32_t descriptor;
 
 /// Options for creating the file.
 struct create_options {
+    /// Object ID to bind the name to, optional. 0 if not present.
+    objid id;
     /// The kind of open/create operation. See CREATE_KIND_*.
     uint8_t kind;
 };
