@@ -42,11 +42,13 @@ static_assert(sizeof(Guard) == sizeof(int64_t));
 
 } // namespace { }
 
+__attribute__((weak))
 extern "C" [[ gnu::visibility("hidden") ]] void __cxa_pure_virtual() {
 	mlibc::panicLogger() << "mlibc: Pure virtual function called from IP "
 			<< (void *)__builtin_return_address(0) << frg::endlog;
 }
 
+__attribute__((weak))
 extern "C" [[ gnu::visibility("hidden") ]] int __cxa_guard_acquire(int64_t *ptr) {
 	auto guard = reinterpret_cast<Guard *>(ptr);
 	guard->lock();
@@ -60,6 +62,7 @@ extern "C" [[ gnu::visibility("hidden") ]] int __cxa_guard_acquire(int64_t *ptr)
 	}
 }
 
+__attribute__((weak))
 extern "C" [[ gnu::visibility("hidden") ]] void __cxa_guard_release(int64_t *ptr) {
 	auto guard = reinterpret_cast<Guard *>(ptr);
 	// do a store-release so that compiler generated code can skip calling
@@ -67,4 +70,3 @@ extern "C" [[ gnu::visibility("hidden") ]] void __cxa_guard_release(int64_t *ptr
 	__atomic_store_n(&guard->complete, 1, __ATOMIC_RELEASE);
 	guard->unlock();
 }
-
