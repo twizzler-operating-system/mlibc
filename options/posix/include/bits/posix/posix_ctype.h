@@ -25,7 +25,7 @@ int isxdigit_l(int __c, locale_t __loc);
 int isascii_l(int __c, locale_t __loc);
 
 int tolower_l(int __c, locale_t __loc);
-int toupper_l(int __c, locale_t __loc); 
+int toupper_l(int __c, locale_t __loc);
 
 #endif /* !__MLIBC_ABI_ONLY */
 
