@@ -77,6 +77,12 @@ if not no_headers
 	)
 
 	install_headers(
+	    '../../options/linux/include/sys/sysmacros.h',
+		subdir: 'sys',
+	)
+
+
+	install_headers(
 		'include/twizzler/error.h',
 		'include/twizzler/types.h',
 		subdir: 'twizzler',

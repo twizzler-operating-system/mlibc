@@ -435,9 +435,9 @@ rtld_sources += [
 	#'options/internal/generic/inline-emitter.cpp',
 	#'options/internal/generic/frigg.cpp',
 	#'options/internal/generic/ubsan.cpp',
-	'options/rtld/generic/main.cpp',
-	'options/rtld/generic/linker.cpp',
-	'options/rtld' / host_machine.cpu_family() / 'runtime.S'
+	#'options/rtld/generic/main.cpp',
+	#'options/rtld/generic/linker.cpp',
+	#'options/rtld' / host_machine.cpu_family() / 'runtime.S'
 ]
 
 rtld_dso_sources += ['options/rtld' / host_machine.cpu_family() / 'entry.S']
