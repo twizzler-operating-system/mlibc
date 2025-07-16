@@ -11,7 +11,7 @@
 #include <mlibc/tcb.hpp>
 #include <mlibc/time-helpers.hpp>
 
-extern "C" Tcb *__rtld_allocateTcb();
+//extern "C" Tcb *__rtld_allocateTcb();
 
 namespace {
 
@@ -70,7 +70,7 @@ int thread_once(__mlibc_once *once, void (*func) (void)) {
 }
 
 int thread_create(struct __mlibc_thread_data **__restrict thread, const struct __mlibc_threadattr *__restrict attrp, void *entry, void *__restrict user_arg, bool returns_int) {
-	auto new_tcb = __rtld_allocateTcb();
+	//auto new_tcb = __rtld_allocateTcb();
 	pid_t tid;
 	struct __mlibc_threadattr attr = {};
 	if (!attrp)
@@ -91,26 +91,26 @@ int thread_create(struct __mlibc_thread_data **__restrict thread, const struct _
 		MLIBC_MISSING_SYSDEP();
 		return ENOSYS;
 	}
-	int ret = mlibc::sys_prepare_stack(&stack, entry,
-			user_arg, new_tcb, &attr.__mlibc_stacksize, &attr.__mlibc_guardsize, &new_tcb->stackAddr);
-	if (ret)
-		return ret;
+	//int ret = mlibc::sys_prepare_stack(&stack, entry,
+	//		user_arg, new_tcb, &attr.__mlibc_stacksize, &attr.__mlibc_guardsize, &new_tcb->stackAddr);
+	//if (ret)
+	//	return ret;
 
 	if (!mlibc::sys_clone) {
 		MLIBC_MISSING_SYSDEP();
 		return ENOSYS;
 	}
-	new_tcb->stackSize = attr.__mlibc_stacksize;
-	new_tcb->guardSize = attr.__mlibc_guardsize;
-	new_tcb->returnValueType = (returns_int) ? TcbThreadReturnValue::Integer : TcbThreadReturnValue::Pointer;
-	new_tcb->isJoinable = (attr.__mlibc_detachstate == __MLIBC_THREAD_CREATE_JOINABLE);
-	mlibc::sys_clone(new_tcb, &tid, stack);
-	*thread = reinterpret_cast<struct __mlibc_thread_data *>(new_tcb);
+	//new_tcb->stackSize = attr.__mlibc_stacksize;
+	//new_tcb->guardSize = attr.__mlibc_guardsize;
+	//new_tcb->returnValueType = (returns_int) ? TcbThreadReturnValue::Integer : TcbThreadReturnValue::Pointer;
+	//new_tcb->isJoinable = (attr.__mlibc_detachstate == __MLIBC_THREAD_CREATE_JOINABLE);
+	//mlibc::sys_clone(new_tcb, &tid, stack);
+	//*thread = reinterpret_cast<struct __mlibc_thread_data *>(new_tcb);
 
-	__atomic_store_n(&new_tcb->tid, tid, __ATOMIC_RELAXED);
-	mlibc::sys_futex_wake(&new_tcb->tid);
+	//__atomic_store_n(&new_tcb->tid, tid, __ATOMIC_RELAXED);
+	//mlibc::sys_futex_wake(&new_tcb->tid);
 
-	return 0;
+	return ENOSYS;
 }
 
 int thread_join(struct __mlibc_thread_data *thread, void *ret) {

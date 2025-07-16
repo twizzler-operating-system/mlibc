@@ -173,8 +173,10 @@ int abstract_file::read(char *buffer, size_t max_size, size_t *actual_size) {
 int abstract_file::write(const char *buffer, size_t max_size, size_t *actual_size) {
 	__ensure(max_size);
 
+	mlibc::infoLogger() << "GOT HERE: A" << frg::endlog;
 	if(_init_bufmode())
 		return -1;
+	mlibc::infoLogger() << "GOT HERE: AA" << frg::endlog;
 	if(globallyDisableBuffering || _bufmode == buffer_mode::no_buffer) {
 		// As we do not buffer, nothing can be dirty.
 		__ensure(__dirty_begin == __dirty_end);
@@ -187,6 +189,7 @@ int abstract_file::write(const char *buffer, size_t max_size, size_t *actual_siz
 		return 0;
 	}
 
+	mlibc::infoLogger() << "GOT HERE: B" << frg::endlog;
 	// Flush the buffer if necessary.
 	if(__offset == __buffer_size) {
 		if(int e = _write_back(); e)
@@ -207,6 +210,7 @@ int abstract_file::write(const char *buffer, size_t max_size, size_t *actual_siz
 	__ensure(__offset < __buffer_size);
 	auto chunk = frg::min(__buffer_size - __offset, max_size);
 
+	mlibc::infoLogger() << "GOT HERE: C" << frg::endlog;
 	// Line-buffered streams perform I/O on full lines.
 	bool flush_line = false;
 	if(_bufmode == buffer_mode::line_buffer) {
@@ -222,6 +226,7 @@ int abstract_file::write(const char *buffer, size_t max_size, size_t *actual_siz
 	_ensure_allocation();
 	memcpy(__buffer_ptr + __offset, buffer, chunk);
 
+	mlibc::infoLogger() << "GOT HERE: D" << frg::endlog;
 	if(__dirty_begin != __dirty_end) {
 		__dirty_begin = frg::min(__dirty_begin, __offset);
 		__dirty_end = frg::max(__dirty_end, __offset + chunk);
@@ -338,8 +343,12 @@ int abstract_file::_init_bufmode() {
 	if(_bufmode != buffer_mode::unknown)
 		return 0;
 
-	if(determine_bufmode(&_bufmode))
-		return -1;
+	mlibc::infoLogger() << "B0" << frg::endlog;
+	if(determine_bufmode(&_bufmode)) {
+    	mlibc::infoLogger() << "Bx" << frg::endlog;
+    	return -1;
+	}
+    	mlibc::infoLogger() << "B1" << frg::endlog;
 	__ensure(_bufmode != buffer_mode::unknown);
 	return 0;
 }
@@ -488,6 +497,11 @@ int fd_file::determine_type(stream_type *type) {
 
 int fd_file::determine_bufmode(buffer_mode *mode) {
 	// When isatty() is not implemented, we fall back to the safest default (no buffering).
+
+	mlibc::infoLogger() << "det_bufmode: " << (long)mode << frg::endlog;
+	*mode = buffer_mode::no_buffer;
+	return 0;
+	//mlibc::infoLogger() << "det_bufmode: " << (long)mlibc::sys_isatty << frg::endlog;
 	if(!mlibc::sys_isatty) {
 		MLIBC_MISSING_SYSDEP();
 		*mode = buffer_mode::no_buffer;
@@ -747,4 +761,3 @@ void __fpurge(FILE *file_base) {
 	file->purge();
 }
 #endif
-

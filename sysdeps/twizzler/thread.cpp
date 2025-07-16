@@ -17,4 +17,8 @@ static constexpr size_t default_stacksize = 0x200000;
 int sys_prepare_stack(void **stack, void *entry, void *user_arg, void *tcb, size_t *stack_size, size_t *guard_size, void **stack_base) {
 	return -ENOSYS;
 }
+
+// Declared in options/internal/mlibc/tcb.hpp.
+bool tcb_available_flag = false;
+
 } // namespace mlibc
