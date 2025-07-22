@@ -78,6 +78,7 @@ if not no_headers
 
 	install_headers(
 	    '../../options/linux/include/sys/sysmacros.h',
+	    'include/sys/random.h',
 		subdir: 'sys',
 	)
 
