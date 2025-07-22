@@ -97,14 +97,19 @@ int sys_anon_free(void *pointer, size_t size) {
 }
 
 int sys_fadvise(int fd, off_t offset, off_t length, int advice) {
-	return ENOSYS;
+    // TODO
+	return 0;
 }
 
 int sys_open(const char *path, int flags, mode_t mode, int *fd) {
+    sys_libc_log("call to open");
+    sys_libc_log(path);
 	return ENOSYS;
 }
 
 int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
+    sys_libc_log("call to openat");
+    sys_libc_log(path);
 	return ENOSYS;
 }
 
@@ -142,6 +147,7 @@ int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
 }
 
 int sys_seek(int fd, off_t offset, int whence, off_t *new_offset) {
+    sys_libc_log("call to seek");
 	// TODO
 	return 0;
 }
@@ -205,7 +211,10 @@ int sys_vm_protect(void *pointer, size_t size, int prot) {
 #ifndef MLIBC_BUILDING_RTLD
 
 int sys_clock_get(int clock, time_t *secs, long *nanos) {
-	return ENOSYS;
+    // TODO
+    *secs = 0;
+    *nanos = 0;
+    return 0;
 }
 
 int sys_clock_getres(int clock, time_t *secs, long *nanos) {
@@ -213,14 +222,17 @@ int sys_clock_getres(int clock, time_t *secs, long *nanos) {
 }
 
 int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat *statbuf) {
+    sys_libc_log("call to stat");
 	return ENOSYS;
 }
 
 int sys_statfs(const char *path, struct statfs *buf) {
+    sys_libc_log("call to statfs");
 	return ENOSYS;
 }
 
 int sys_fstatfs(int fd, struct statfs *buf) {
+    sys_libc_log("call to fstatfs");
 	return ENOSYS;
 }
 
@@ -229,7 +241,7 @@ extern "C" void __mlibc_signal_restore_rt(void);
 
 int sys_sigaction(int signum, const struct sigaction *act,
 		struct sigaction *oldact) {
-	return ENOSYS;
+	return 0;
 }
 
 int sys_socket(int domain, int type, int protocol, int *fd) {
@@ -253,11 +265,16 @@ int sys_msg_recv(int sockfd, struct msghdr *msg, int flags, ssize_t *length) {
 }
 
 int sys_fcntl(int fd, int cmd, va_list args, int *result) {
+    sys_libc_log("call to fcntl");
 	return ENOSYS;
 }
 
 int sys_getcwd(char *buf, size_t size) {
-	return ENOSYS;
+    *buf = '/';
+    *(buf + 1) = 0;
+    return 0;
+    //sys_libc_log("call to getcwd");
+	//return ENOSYS;
 }
 
 int sys_unlinkat(int dfd, const char *path, int flags) {
@@ -265,7 +282,10 @@ int sys_unlinkat(int dfd, const char *path, int flags) {
 }
 
 int sys_sleep(time_t *secs, long *nanos) {
-	return ENOSYS;
+    *secs = 0;
+    *nanos = 0;
+    // TODO
+	return 0;
 }
 
 int sys_isatty(int fd) {
@@ -382,10 +402,12 @@ int sys_tcflow(int fd, int action) {
 }
 
 int sys_access(const char *path, int mode) {
+    sys_libc_log("call to access");
 	return ENOSYS;
 }
 
 int sys_faccessat(int dirfd, const char *pathname, int mode, int flags) {
+    sys_libc_log("call to faccessat");
 	return ENOSYS;
 }
 
@@ -428,10 +450,12 @@ int sys_setpriority(int which, id_t who, int prio) {
 }
 
 int sys_open_dir(const char *path, int *fd) {
+    sys_libc_log("call to open dir");
 	return ENOSYS;
 }
 
 int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_read) {
+    sys_libc_log("call to read entries");
 	return ENOSYS;
 }
 
@@ -527,11 +551,13 @@ int sys_futex_wake(int *pointer) {
 }
 
 int sys_mkdir(const char *path, mode_t mode) {
+    sys_libc_log("call to mkdir");
 	return ENOSYS;
 }
 
 
 int sys_mkdirat(int dirfd, const char *path, mode_t mode) {
+    sys_libc_log("call to mkdirat");
 	return ENOSYS;
 }
 
@@ -556,10 +582,12 @@ int sys_umask(mode_t mode, mode_t *old) {
 }
 
 int sys_chdir(const char *path) {
+    sys_libc_log("call to chdir");
 	return ENOSYS;
 }
 
 int sys_fchdir(int fd) {
+    sys_libc_log("call to fchdir");
 	return ENOSYS;
 }
 
@@ -632,11 +660,13 @@ int sys_fdatasync(int fd) {
 }
 
 int sys_getrandom(void *buffer, size_t length, int flags, ssize_t *bytes_written) {
-	return ENOSYS;
+    // TODO
+    return 0;
 }
 
 int sys_getentropy(void *buffer, size_t length) {
-	return ENOSYS;
+    // TODO
+    return 0;
 }
 
 } // namespace mlibc
