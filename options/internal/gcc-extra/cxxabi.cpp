@@ -1,7 +1,8 @@
 
 #include <bits/ensure.h>
 
-/*
+#if !defined(__Twizzler__)
+
 // The cxxabi needs operator delete for *deleting* destructors, i.e., destructors that
 // are called by delete expressions. We never use such expressions in mlibc.
 // Note that G++ complains if we make the operator hidden,
@@ -12,14 +13,12 @@
 	}
 #endif
 
-__attribute__((weak))
 extern "C" [[gnu::visibility("hidden")]] void _ZdlPvj() { // operator delete (void *, unsigned int)
 	__ensure(!"operator delete called! delete expressions cannot be used in mlibc.");
 }
 
-__attribute__((weak))
 extern "C" [[gnu::visibility("hidden")]] void _ZdlPvm() { // operator delete (void *, size_t)
 	__ensure(!"operator delete called! delete expressions cannot be used in mlibc.");
 }
 
-*/
+#endif
