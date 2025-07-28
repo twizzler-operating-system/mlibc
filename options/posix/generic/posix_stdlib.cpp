@@ -539,9 +539,9 @@ int getsubopt(char **__restrict__, char *const *__restrict__, char **__restrict_
 }
 
 char *secure_getenv(const char *name) {
-//	if (mlibc::rtldConfig().secureRequired)
-//		return NULL;
-//	else
+	if (mlibc::rtldConfig().secureRequired)
+		return NULL;
+	else
 		return getenv(name);
 }
 

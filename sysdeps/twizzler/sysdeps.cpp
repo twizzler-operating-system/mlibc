@@ -18,6 +18,7 @@
 #include <twizzler/rt/fd.h>
 #include <twizzler/rt/io.h>
 #include <twizzler/rt/alloc.h>
+#include <twizzler/rt/core.h>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
@@ -57,6 +58,14 @@ extern "C" long __do_syscall_ret(unsigned long ret) {
 	return ret;
 }
 #endif
+
+#include<mlibc/rtld-config.hpp>
+mlibc::RtldConfig rtldConfig;
+
+extern "C" [[ gnu::visibility("default") ]]
+const mlibc::RtldConfig &__dlapi_get_config() {
+	return rtldConfig;
+}
 
 namespace mlibc {
 
@@ -525,11 +534,11 @@ int sys_kill(int pid, int sig) {
 }
 
 void sys_thread_exit() {
-	// TODO
+    twz_rt_exit(0);
 }
 
 void sys_exit(int status) {
-	// TODO
+    twz_rt_exit(status);
 }
 
 #define FUTEX_WAIT 0

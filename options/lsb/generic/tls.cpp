@@ -2,7 +2,10 @@
 #include <mlibc/thread.hpp>
 #include <mlibc/rtld-abi.hpp>
 
-/*
+#if defined(__Twizzler__)
+extern "C" void *__tls_get_addr(struct __abi_tls_entry *entry);
+#else
+
 #if (defined(__riscv) || defined(__m68k__) || defined(__loongarch64)) && defined(MLIBC_STATIC_BUILD)
 	// On RISC-V, m68k and loongarch64, linker optimisation is not guaranteed and so we may
 	// still get calls to this function in statically linked binaries.
@@ -17,8 +20,8 @@
 		return __dlapi_get_tls(entry);
 	}
 #else
-	//extern "C" void *__tls_get_addr(struct __abi_tls_entry *entry) {
-	//	return __dlapi_get_tls(entry);
-	//}
+	extern "C" void *__tls_get_addr(struct __abi_tls_entry *entry) {
+		return __dlapi_get_tls(entry);
+	}
 #endif
-*/
+#endif

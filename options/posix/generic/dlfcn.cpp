@@ -13,8 +13,6 @@ struct __dlapi_symbol {
 	void *link_map;
 };
 
-#if 0
-
 extern "C" const char *__dlapi_error();
 extern "C" void *__dlapi_open(const char *, int, void *);
 extern "C" void *__dlapi_resolve(void *, const char *, void *, const char *);
@@ -94,5 +92,3 @@ int dlinfo(void *__restrict, int, void *__restrict) {
 }
 
 #endif // __MLIBC_GLIBC_OPTION
-
-#endif

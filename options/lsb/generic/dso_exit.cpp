@@ -82,5 +82,7 @@ void __mlibc_do_finalize() {
 	// Call fini/fini_array functions of each loaded object. This is necessary
 	// to implement [[gnu::destructor]]. Note that C++ applications will call
 	// __cxa_finalize from here.
-	//__dlapi_exit();
+#if !defined(__Twizzler__)
+	__dlapi_exit();
+#endif
 }

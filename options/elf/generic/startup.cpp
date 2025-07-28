@@ -26,6 +26,7 @@ void init_libc() {
 
 void parse_exec_stack(void *opaque_sp, exec_stack_data *data) {
 	auto sp = reinterpret_cast<uintptr_t *>(opaque_sp);
+	if(sp == nullptr) return;
 	data->argc = *sp++;
 	data->argv = reinterpret_cast<char **>(sp);
 	sp += data->argc; // Skip all arguments.
@@ -57,4 +58,3 @@ void set_startup_data(int argc, char **argv, char **envp) {
 }
 
 } // namespace mlibc
-

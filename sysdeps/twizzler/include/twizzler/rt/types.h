@@ -3,6 +3,7 @@
 #include "../error.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 /// Error or value
 struct u32_result {
@@ -33,5 +34,3 @@ struct io_result {
   twz_error err;
   size_t val;
 };
-
-
