@@ -17,11 +17,19 @@ struct dl_phdr_info {
 	/// Pointer to program headers
 	const void *phdr;
 	/// Number of program headers
-  uint32_t phnum;
+    uint32_t phnum;
 	unsigned long long int adds;
 	unsigned long long int subs;
 	size_t tls_modid;
 	void *tls_data;
+};
+
+struct link_map {
+    uintptr_t addr;
+    char *name;
+    void *ld;
+    void *next;
+    void *prev;
 };
 
 /// An ID for a loaded program image (or library)
