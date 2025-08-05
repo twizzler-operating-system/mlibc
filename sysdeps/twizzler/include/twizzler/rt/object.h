@@ -25,6 +25,8 @@ const map_flags MAP_FLAG_X = 4;
 const map_flags MAP_FLAG_PERSIST = 8;
 /// Allow the runtime to provide additional safety properties.
 const map_flags MAP_FLAG_INDIRECT = 16;
+/// Don't map a null page for the object.
+const map_flags MAP_FLAG_NO_NULLPAGE = 32;
 
 /// Create a new runtime (volatile, tied to this runtime) object.
 extern struct objid_result twz_rt_create_rtobj(void);
