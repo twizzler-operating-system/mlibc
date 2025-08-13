@@ -2,6 +2,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/mman.h>
 
 #include <type_traits>
 
@@ -101,7 +102,7 @@ int sys_anon_allocate(size_t size, void **pointer) {
 }
 
 int sys_anon_free(void *pointer, size_t size) {
-	// TODO
+    twz_rt_dealloc(pointer, size, 128, 0);
 	return 0;
 }
 
@@ -183,6 +184,15 @@ int sys_utimensat(int dirfd, const char *pathname, const struct timespec times[2
 
 int sys_vm_map(void *hint, size_t size, int prot, int flags,
 		int fd, off_t offset, void **window) {
+		//sys_libc_log("call to vm_map");
+		if(!(flags & MAP_ANON) || fd != -1) {
+		    return ENOTSUP;
+		}
+  *window = twz_rt_malloc(size, 0x1000, ZERO_MEMORY);
+    if (*window == NULL) {
+        return -1;
+    }
+    return 0;
 	/*
 	if(offset % 4096)
 		return EINVAL;
@@ -209,11 +219,11 @@ int sys_vm_unmap(void *pointer, size_t size) {
 		return e;
 	return 0;
 	*/
-	return ENOSYS;
+	return 0;
 }
 
 int sys_vm_protect(void *pointer, size_t size, int prot) {
-	return ENOSYS;
+	return 0;
 }
 
 // All remaining functions are disabled in ldso.
