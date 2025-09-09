@@ -1,4 +1,4 @@
-project('mlibc', default_options: ['warning_level=2', 'c_std=gnu11', 'cpp_std=c++20'], meson_version: '>=1.3.0')
+project('mlibc', default_options: ['warning_level=2', 'c_std=gnu11', 'cpp_std=c++23'], meson_version: '>=1.3.0')
 
 fs = import('fs')
 
@@ -37,8 +37,8 @@ mlibc_conf = configuration_data()
 if not headers_only
 	add_languages('c', 'cpp', native: true, required: false)
 	add_languages('c', 'cpp', native: false)
-	c_compiler = meson.get_compiler('c')
-	cpp_compiler = meson.get_compiler('cpp')
+	c_compiler = meson.get_compiler('c', native: false)
+	cpp_compiler = meson.get_compiler('cpp', native: false)
 
 	target_triple = run_command(c_compiler.cmd_array(), '-dumpmachine', check: true).stdout()
 	use_freestnd_hdrs = get_option('use_freestnd_hdrs').disable_auto_if(
@@ -82,7 +82,7 @@ if not headers_only
 	endif
 
 	if not freestnd_c_hdrs_dep.found()
-		searchdirs = run_command(c_compiler.cmd_array(), '-print-search-dirs',
+		searchdirs = run_command(c_compiler.cmd_array(), get_option('c_args'), '-print-search-dirs',
 					check: true).stdout()
 		searchdirs_arr = searchdirs.split('\n')
 		searchline = 'install: '
@@ -92,6 +92,7 @@ if not headers_only
 		endif
 
 		foreach line : searchdirs_arr
+		    message(line)
 			if line.startswith(searchline)
 				ccdir = line.strip(searchline)
 				ccdir = ccdir.split(':')[0]
@@ -115,12 +116,12 @@ if not headers_only
 	if not freestnd_cxx_hdrs_dep.found()
 		cplusplus_include_path = []
 
-		c_output = run_command(c_compiler.cmd_array(), '-E', '-v', '-x', 'c',
+		c_output = run_command(c_compiler.cmd_array(), get_option('cpp_args'), '-E', '-v', '-x', 'c',
 					'/dev/null', '-o', '-',
 					capture: true,
 					check: true).stderr().split('\n')
 
-		cpp_output = run_command(cpp_compiler.cmd_array(), '-E', '-v', '-x',
+		cpp_output = run_command(cpp_compiler.cmd_array(), get_option('cpp_args'), '-E', '-v', '-x',
 					'c++', '/dev/null', '-o', '-',
 					capture: true,
 					check: true).stderr().split('\n')
@@ -148,10 +149,10 @@ if not headers_only
 				if not line.startswith(' ')
 					break
 				endif
-				debug('maybe relevant', line)
+				message('maybe relevant', line)
 				stripped = line.strip()
 				if stripped in c_relevant_lines
-					debug('not relevant (is C)', line)
+					message('not relevant (is C)', line)
 					continue
 				endif
 				cplusplus_include_path += include_directories(stripped)
