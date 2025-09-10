@@ -1,7 +1,9 @@
+#include "include/twizzler/error.h"
 #include "include/twizzler/rt/info.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/errno.h>
 #include <sys/mman.h>
 
 #include <type_traits>
@@ -24,11 +26,104 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 
+static int twz_errno_generic(uint64_t code) {
+    switch(code) {
+        case NOT_SUPPORTED: return ENOTSUP;
+        case INTERNAL: return ENOTSUP;
+        case WOULD_BLOCK: return EAGAIN;
+        case TIMED_OUT: return ETIMEDOUT;
+        case ACCESS_DENIED: return EACCES;
+        case NO_SUCH_OPERATION: return ENOSYS;
+        case INTERRUPTED: return EINTR;
+        case IN_PROGRESS: return EINPROGRESS;
+        default: return -1;
+    }
+}
+
+static int twz_errno_argument(uint64_t code) {
+    switch(code) {
+        case INVALID_ARGUMENT: return EINVAL;
+        case WRONG_TYPE: return EINVAL;
+        case INVALID_ADDRESS: return EADDRNOTAVAIL;
+        case BAD_HANDLE: return EBADF;
+        default: return EINVAL;
+    }
+}
+
+static int twz_errno_resource(uint64_t code) {
+    switch(code) {
+        case OUT_OF_MEMORY: return ENOMEM;
+        case OUT_OF_NAMES: return EADDRINUSE;
+        case OUT_OF_RESOURCES: return ENOMEM;
+        case UNAVAILABLE: return EADDRNOTAVAIL;
+        case BUSY: return EBUSY;
+        case NOT_CONNECTED: return ENOTCONN;
+        case UNREACHABLE: return EADDRNOTAVAIL;
+        case REFUSED: return EREMOTE;
+        case NON_ATOMIC: return ENOTSUP;
+        default: return EINVAL;
+    }
+}
+
+static int twz_errno_naming(uint64_t code) {
+    switch(code) {
+        case NOT_FOUND: return ENOENT;
+        case ALREADY_BOUND: return EADDRINUSE;
+        case ALREADY_EXISTS: return EEXIST;
+        case WRONG_NAME_KIND: return EINVAL;
+        case INVALID_NAME: return ENAMETOOLONG;
+        case LINK_LOOP: return ELOOP;
+        case NOT_EMPTY: return ENOTEMPTY;
+        default: return EINVAL;
+    }
+}
+
+static int twz_errno_object(uint64_t code) {
+    switch(code) {
+        case MAPPING_FAILED: return ENOMEM;
+        case NOT_MAPPED: return EBADF;
+        case INVALID_FOTE: return EINVAL;
+        case INVALID_PTR: return EINVAL;
+        case INVALID_META: return EINVAL;
+        case BASETYPE_MISMATCH: return EINVAL;
+        case NO_SUCH_OBJECT: return ENOENT;
+        default: return EINVAL;
+    }
+}
+
+static int twz_errno_io(uint64_t code) {
+    switch(code) {
+        case DATA_LOSS: return ENODATA;
+        default: return EIO;
+    }
+}
+
+static int twz_errno_security(uint64_t code) {
+    switch(code) {
+        case INVALID_KEY: return EINVAL;
+        case INVALID_SCHEME: return EINVAL;
+        case SIGNATURE_MISMATCH: return EINVAL;
+        case INVALID_GATE: return EINVAL;
+        case GATE_DENIED: return EPERM;
+        default: return EACCES;
+    }
+}
+
 int twz_error_errno(uint64_t err) {
 	if (err == 0) {
 		return 0;
 	}
-	// TODO
+	uint64_t category = (err & ERROR_CATEGORY_MASK) >> ERROR_CATEGORY_SHIFT;
+	uint64_t code = (err & ERROR_CODE_MASK) >> ERROR_CODE_SHIFT;
+	switch(category) {
+		case GENERIC_ERROR: return twz_errno_generic(code);
+		case ARGUMENT_ERROR: return twz_errno_argument(code);
+		case RESOURCE_ERROR: return twz_errno_resource(code);
+		case NAMING_ERROR: return twz_errno_naming(code);
+		case OBJECT_ERROR: return twz_errno_object(code);
+		case IO_ERROR: return twz_errno_io(code);
+		case SECURITY_ERROR: return twz_errno_security(code);
+	}
 	return -1;
 }
 
@@ -89,7 +184,7 @@ void sys_libc_panic() {
 }
 
 int sys_tcb_set(void *pointer) {
-	// TODO
+    mlibc::sys_libc_log("tried to set TCB from within Twizzler-managed libc");
 	return 0;
 }
 
@@ -112,20 +207,66 @@ int sys_fadvise(int fd, off_t offset, off_t length, int advice) {
 }
 
 int sys_open(const char *path, int flags, mode_t mode, int *fd) {
-    sys_libc_log("call to open");
-    sys_libc_log(path);
-	return ENOSYS;
+    return sys_openat(AT_FDCWD, path, flags, mode, fd);
 }
 
 int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
-    sys_libc_log("call to openat");
-    sys_libc_log(path);
-	return ENOSYS;
+    (void)mode;
+    if (dirfd != AT_FDCWD) {
+        return ENOSYS;
+    }
+    struct create_options co = {
+        .id = 0,
+        .kind = CREATE_KIND_EXISTING,
+    };
+    if (flags & O_CREAT) {
+        if (flags & O_EXCL) {
+            co.kind = CREATE_KIND_NEW;
+        } else {
+            co.kind = CREATE_KIND_EITHER;
+        }
+    }
+    uint32_t open_flags = 0;
+    if (flags & O_WRONLY) {
+        open_flags |= OPEN_FLAG_WRITE;
+    }
+    if (flags & O_RDONLY) {
+        open_flags |= OPEN_FLAG_READ;
+    }
+    if (flags & O_RDWR) {
+        open_flags |= OPEN_FLAG_READ | OPEN_FLAG_WRITE;
+    }
+    if (flags & O_TRUNC) {
+        open_flags |= OPEN_FLAG_TRUNCATE;
+    }
+    if (flags & O_APPEND) {
+        open_flags |= OPEN_FLAG_TAIL;
+    }
+    //if (flags & O_SYMLINK) {
+    //    open_flags |= OPEN_FLAG_SYMLINK;
+    //}
+    if (flags & O_SEARCH) {
+        open_flags |= OPEN_FLAG_READ;
+    }
+    struct open_info args = {
+        .name = path,
+        .len = strlen(path),
+        .create = co,
+        .flags = open_flags,
+    };
+    struct open_result res = twz_rt_fd_open(args);
+    if (res.err != SUCCESS) {
+        return twz_error_errno(res.err);
+    }
+    if(fd) {
+        *fd = res.fd;
+    }
+    return 0;
 }
 
 int sys_close(int fd) {
-	// TODO
-	return 0;
+    twz_rt_fd_close(fd);
+    return 0;
 }
 
 int sys_dup2(int fd, int flags, int newfd) {
@@ -133,11 +274,39 @@ int sys_dup2(int fd, int flags, int newfd) {
 }
 
 int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
-	return ENOSYS;
+   	struct io_ctx ctx = {
+		.flags = 0,
+		.offset = FD_POS,
+		.timeout = NO_DURATION,
+	};
+	if (bytes_read != nullptr) {
+		*bytes_read = 0;
+	}
+	struct io_result res = twz_rt_fd_pread((descriptor)fd, buffer, size, &ctx);
+	if (res.err == SUCCESS) {
+		if (bytes_read != nullptr) {
+			*bytes_read = (ssize_t)res.val;
+		}
+		return 0;
+	}
+	return twz_error_errno(res.err);
 }
 
 int sys_readv(int fd, const struct iovec *iovs, int iovc, ssize_t *bytes_read) {
-	return ENOSYS;
+    if (bytes_read != nullptr) {
+		*bytes_read = 0;
+	}
+    for(int i = 0; i < iovc; i++) {
+        ssize_t thisread = 0;
+        int e = sys_read(fd, iovs[i].iov_base, iovs[i].iov_len, &thisread);
+        if (bytes_read != nullptr) {
+			*bytes_read += thisread;
+		}
+        if (e != 0) {
+            return e;
+        }
+    }
+    return 0;
 }
 
 int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
@@ -146,6 +315,9 @@ int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
 		.offset = FD_POS,
 		.timeout = NO_DURATION,
 	};
+	if (bytes_written != nullptr) {
+		*bytes_written = 0;
+	}
 	struct io_result res = twz_rt_fd_pwrite((descriptor)fd, buffer, size, &ctx);
 	if (res.err == SUCCESS) {
 		if (bytes_written != nullptr) {
@@ -156,10 +328,25 @@ int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
 	return twz_error_errno(res.err);
 }
 
-int sys_seek(int fd, off_t offset, int whence, off_t *new_offset) {
-    sys_libc_log("call to seek");
-	// TODO
-	return 0;
+int sys_seek(int fd, off_t offset, int whenc, off_t *new_offset) {
+    whence tw = 0;
+    if (whenc == SEEK_SET) {
+        tw = WHENCE_START;
+    }
+    if (whenc == SEEK_CUR) {
+        tw = WHENCE_CURRENT;
+    }
+    if (whenc == SEEK_END) {
+        tw = WHENCE_END;
+    }
+   	struct io_result res = twz_rt_fd_seek(fd, tw, offset);
+	if (res.err == SUCCESS) {
+		if (new_offset != nullptr) {
+			*new_offset = (off_t)res.val;
+		}
+		return 0;
+	}
+	return twz_error_errno(res.err);
 }
 
 int sys_chmod(const char *pathname, mode_t mode) {
@@ -241,8 +428,28 @@ int sys_clock_getres(int clock, time_t *secs, long *nanos) {
 }
 
 int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat *statbuf) {
-    sys_libc_log("call to stat");
-	return ENOSYS;
+    if (fsfdt == mlibc::fsfd_target::fd_path) {
+        int e = sys_openat(fd, path, O_RDONLY, 0, &fd);
+        if (e != 0) {
+            return e;
+        }
+    }
+    struct fd_info info;
+    if (!twz_rt_fd_get_info(fd, &info)) {
+        return EBADF;
+    }
+    statbuf->st_dev = 0;
+    statbuf->st_ino = 0;
+    statbuf->st_mode = info.unix_mode;
+    statbuf->st_nlink = 1;
+    statbuf->st_uid = 0;
+    statbuf->st_gid = 0;
+    statbuf->st_rdev = 0;
+    statbuf->st_atime = info.accessed.seconds;
+    statbuf->st_mtime = info.modified.seconds;
+    statbuf->st_ctime = info.created.seconds;
+    statbuf->st_size = info.len;
+    return 0;
 }
 
 int sys_statfs(const char *path, struct statfs *buf) {
@@ -487,11 +694,42 @@ int sys_gethostname(char *buf, size_t bufsize) {
 }
 
 int sys_pread(int fd, void *buf, size_t n, off_t off, ssize_t *bytes_read) {
+   	struct io_ctx ctx = {
+		.flags = 0,
+		.offset = off,
+		.timeout = NO_DURATION,
+	};
+	if (bytes_read != nullptr) {
+		*bytes_read = 0;
+	}
+	struct io_result res = twz_rt_fd_pread((descriptor)fd, buf, n, &ctx);
+	if (res.err == SUCCESS) {
+		if (bytes_read != nullptr) {
+			*bytes_read = (ssize_t)res.val;
+		}
+		return 0;
+	}
+	return twz_error_errno(res.err);
 	return ENOSYS;
 }
 
 int sys_pwrite(int fd, const void *buf, size_t n, off_t off, ssize_t *bytes_written) {
-	return ENOSYS;
+   	struct io_ctx ctx = {
+		.flags = 0,
+		.offset = off,
+		.timeout = NO_DURATION,
+	};
+	if (bytes_written != nullptr) {
+		*bytes_written = 0;
+	}
+	struct io_result res = twz_rt_fd_pwrite((descriptor)fd, buf, n, &ctx);
+	if (res.err == SUCCESS) {
+		if (bytes_written != nullptr) {
+			*bytes_written = (ssize_t)res.val;
+		}
+		return 0;
+	}
+	return twz_error_errno(res.err);
 }
 
 int sys_getsockopt(int fd, int layer, int number, void *__restrict buffer, socklen_t *__restrict size) {
@@ -516,27 +754,27 @@ int sys_sysconf(int num, long *ret) {
 #endif // __MLIBC_POSIX_OPTION
 //
 pid_t sys_getpid() {
-	return ENOSYS;
+	return 1;
 }
 
 pid_t sys_gettid() {
-	return ENOSYS;
+	return 1;
 }
 
 uid_t sys_getuid() {
-	return ENOSYS;
+	return 0;
 }
 
 uid_t sys_geteuid() {
-	return ENOSYS;
+	return 0;
 }
 
 gid_t sys_getgid() {
-	return ENOSYS;
+	return 0;
 }
 
 gid_t sys_getegid() {
-	return ENOSYS;
+	return 0;
 }
 
 int sys_kill(int pid, int sig) {
@@ -556,7 +794,6 @@ void sys_exit(int status) {
 
 int sys_futex_tid() {
 	return 1;
-	//return ENOSYS;
 }
 
 int sys_futex_wait(int *pointer, int expected, const struct timespec *time) {
@@ -635,7 +872,7 @@ pid_t sys_getppid() {
 }
 
 int sys_setpgid(pid_t pid, pid_t pgid) {
-	return ENOSYS;
+	return 0;
 }
 
 int sys_getsid(pid_t pid, pid_t *sid) {
@@ -643,15 +880,15 @@ int sys_getsid(pid_t pid, pid_t *sid) {
 }
 
 int sys_setsid(pid_t *sid) {
-	return ENOSYS;
+	return 0;
 }
 
 int sys_setuid(uid_t uid) {
-	return ENOSYS;
+	return 0;
 }
 
 int sys_setgid(gid_t gid) {
-	return ENOSYS;
+	return 0;
 }
 
 int sys_getpgid(pid_t pid, pid_t *out) {
