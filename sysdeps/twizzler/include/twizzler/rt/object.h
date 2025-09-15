@@ -28,13 +28,27 @@ const map_flags MAP_FLAG_INDIRECT = 16;
 /// Don't map a null page for the object.
 const map_flags MAP_FLAG_NO_NULLPAGE = 32;
 
+
+/// Mapping flags
+typedef uint32_t release_flags;
+
+/// Don't cache this handle on release.
+const release_flags RELEASE_NO_CACHE = 1;
+
 /// Create a new runtime (volatile, tied to this runtime) object.
 extern struct objid_result twz_rt_create_rtobj(void);
 
 /// Map an object with a given ID and flags.
 extern struct map_result twz_rt_map_object(objid id, map_flags flags);
 /// Release an object handle. After calling this, the handle may not be used.
-extern void twz_rt_release_handle(struct object_handle *handle);
+extern void twz_rt_release_handle(struct object_handle *handle, release_flags flags);
+
+typedef uint32_t object_cmd;
+
+const object_cmd OBJECT_CMD_DELETE = 1;
+
+/// Modify an object.
+extern twz_error twz_rt_object_cmd(struct object_handle *handle, object_cmd cmd, uint64_t arg);
 
 /// Update an object handle.
 extern twz_error twz_rt_update_handle(struct object_handle *handle);
