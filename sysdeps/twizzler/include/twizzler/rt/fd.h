@@ -62,6 +62,7 @@ enum open_anon_kind {
   AnonKind_Pipe,
   AnonKind_SocketConnect,
   AnonKind_SocketBind,
+  AnonKind_SocketAccept,
 };
 
 enum addr_kind {
