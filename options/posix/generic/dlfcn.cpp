@@ -86,5 +86,3 @@ int dlinfo(void *__restrict, int, void *__restrict) {
 	__ensure(!"dlinfo() not implemented");
 	__builtin_unreachable();
 }
-
-#endif // __MLIBC_GLIBC_OPTION

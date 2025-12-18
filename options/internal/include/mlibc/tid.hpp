@@ -5,6 +5,8 @@
 
 namespace mlibc {
 	inline unsigned int this_tid() {
+	// TODO(twizzler)
+	    return 1;
 		// During RTLD initialization, we don't have a TCB.
 		if (mlibc::tcb_available_flag) {
 			auto tcb = get_current_tcb();
