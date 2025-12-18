@@ -67,9 +67,9 @@ extern struct io_result twz_rt_fd_pwrite_to(descriptor fd, const void *buf, size
 /// Io vec, a buffer and a len.
 struct io_vec {
   /// Pointer to buffer.
-  char *buf;
+  void *iov_base;
   /// Length of buffer in bytes.
-  size_t len;
+  size_t iov_len;
 };
 
 /// Do vectored IO read.
@@ -92,4 +92,3 @@ extern twz_error twz_rt_fd_set_config(descriptor fd, uint32_t reg, void *val, si
 #ifdef __cplusplus
 }
 #endif
-
