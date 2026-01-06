@@ -15,6 +15,12 @@ typedef uint32_t io_flags;
 
 /// Non-blocking behavior specified. If the operation would block, return io_result with error set to WouldBlock instead.
 const io_flags IO_NONBLOCKING = 1;
+/// Peek at the data without updating the internal position pointer or consuming any stream data.
+const io_flags IO_PEEK = 2;
+/// Wait for all the data to be ready.
+const io_flags IO_WAITALL = 4;
+/// Process out of band data, if supported.
+const io_flags IO_OOB = 8;
 
 /// Seek offset from start of file
 const whence WHENCE_START = 0;
@@ -87,7 +93,18 @@ extern twz_error twz_rt_fd_waitpoint(descriptor fd, wait_kind ek, uint64_t **poi
 /// Get a config value for register reg.
 extern twz_error twz_rt_fd_get_config(descriptor fd, uint32_t reg, void *val, size_t len);
 /// Set a config value for register reg. Setting a register may have side effects.
-extern twz_error twz_rt_fd_set_config(descriptor fd, uint32_t reg, void *val, size_t len);
+extern twz_error twz_rt_fd_set_config(descriptor fd, uint32_t reg, const void *val, size_t len);
+
+const uint32_t IO_REGISTER_ADDR = 1;
+const uint32_t IO_REGISTER_PEER = 2;
+const uint32_t IO_REGISTER_SOCKET_FLAGS = 3;
+const uint32_t IO_REGISTER_LINGER = 4;
+const uint32_t IO_REGISTER_TTL = 5;
+const uint32_t IO_REGISTER_READTIMEOUT = 6;
+const uint32_t IO_REGISTER_WRITETIMEOUT = 7;
+
+const uint32_t SOCKET_FLAGS_NODELAY = 1;
+const uint32_t SOCKET_FLAGS_ONLYV6 = 2;
 
 #ifdef __cplusplus
 }

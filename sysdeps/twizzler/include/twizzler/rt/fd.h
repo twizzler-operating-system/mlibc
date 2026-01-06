@@ -62,11 +62,17 @@ enum open_anon_kind {
   AnonKind_Pipe,
   AnonKind_SocketConnect,
   AnonKind_SocketBind,
+  AnonKind_SocketAccept,
 };
 
 enum addr_kind {
   AddrKind_Ipv4,
   AddrKind_Ipv6,
+};
+
+enum prot_kind {
+    ProtKind_Stream,
+    ProtKind_Datagram,
 };
 
 union socket_address_addrs {
@@ -84,7 +90,11 @@ struct socket_address {
 
 /// Open a non-named file. The value pointed to by bind_info is dependent on the kind specified in the first
 /// argument. For pipe, bind_info is ignored. For Socket* kinds, bind_info points to a socket_address.
-extern struct open_result twz_rt_fd_open_anon(enum open_anon_kind kind, uint32_t flags, void *bind_info, size_t bind_info_len);
+extern struct open_result twz_rt_fd_open_anon(enum open_anon_kind kind, uint32_t flags, void *bind_info, size_t bind_info_len, enum prot_kind prot);
+
+/// Reopen a file descriptor with a new anon binding. The anon_kind remains unchanged. The value pointed to by bind_info is dependent on the kind specified in the first
+/// argument. For pipe, bind_info is ignored. For Socket* kinds, bind_info points to a socket_address.
+extern twz_error twz_rt_fd_reopen_anon(descriptor fd, uint32_t flags, void *bind_info, size_t bind_info_len, enum prot_kind prot);
 
 /// Close a file descriptor. If the file descriptor is invalid
 /// or already closed, this function does nothing.
@@ -134,6 +144,8 @@ const fd_cmd FD_CMD_DUP = 0;
 const fd_cmd FD_CMD_SYNC = 1;
 /// Truncate the underlying storage of the file descriptor. The arg argument points to a u64 length.
 const fd_cmd FD_CMD_TRUNCATE = 2;
+/// Close either the read or write end of a file descriptor. The arg points to a u32, the first bit of which indicates read-side, the second indicates write.
+const fd_cmd FD_CMD_SHUTDOWN = 3;
 
 /// Perform a command on the descriptor. The arguments arg and ret are interpreted according to
 /// the command specified.
