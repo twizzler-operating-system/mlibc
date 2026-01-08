@@ -20,6 +20,7 @@ extern "C" int __dlapi_reverse(const void *, __dlapi_symbol *);
 extern "C" int __dlapi_close(void *);
 extern "C" int __dlapi_find_object(void *__address, dl_find_object *__result);
 
+[[gnu::weak]]
 int dladdr1(const void *ptr, Dl_info *out, void **extra, int flags) {
 	__dlapi_symbol info;
 	if(__dlapi_reverse(ptr, &info)) {
@@ -45,6 +46,7 @@ int dladdr1(const void *ptr, Dl_info *out, void **extra, int flags) {
 	return 1;
 }
 
+[[gnu::weak]]
 int dlinfo(void *__restrict, int, void *__restrict) {
 	__ensure(!"dlinfo() not implemented");
 	__builtin_unreachable();

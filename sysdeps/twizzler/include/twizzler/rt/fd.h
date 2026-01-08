@@ -94,7 +94,7 @@ extern struct open_result twz_rt_fd_open_anon(enum open_anon_kind kind, uint32_t
 
 /// Reopen a file descriptor with a new anon binding. The anon_kind remains unchanged. The value pointed to by bind_info is dependent on the kind specified in the first
 /// argument. For pipe, bind_info is ignored. For Socket* kinds, bind_info points to a socket_address.
-extern twz_error twz_rt_fd_reopen_anon(descriptor fd, uint32_t flags, void *bind_info, size_t bind_info_len, enum prot_kind prot);
+extern twz_error twz_rt_fd_reopen_anon(descriptor fd, enum open_anon_kind kind, uint32_t flags, void *bind_info, size_t bind_info_len, enum prot_kind prot);
 
 /// Close a file descriptor. If the file descriptor is invalid
 /// or already closed, this function does nothing.
@@ -114,6 +114,8 @@ enum fd_kind {
   FdKind_Directory,
   /// Symbolic link
   FdKind_SymLink,
+  FdKind_Socket,
+  FdKind_Pipe,
 };
 
 /// Information about a file descriptor.
