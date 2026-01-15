@@ -17,16 +17,17 @@ struct create_options {
     uint8_t kind;
 };
 
+const size_t NAME_DATA_MAX = 1024;
+
 /// Information for opening a file.
 struct open_info {
-  /// File name pointer.
-  const char *name;
-  /// Length of file name in bytes.
-  size_t len;
   /// Creation options
   struct create_options create;
   /// Operation flags
   uint32_t flags;
+  /// Length of file name in bytes.
+  size_t len;
+  uint8_t name[NAME_DATA_MAX];
 };
 
 /// Open the file only if it already exists.
@@ -55,14 +56,16 @@ struct open_result {
   twz_error err;
 };
 
-/// Open a file.
-extern struct open_result twz_rt_fd_open(struct open_info info);
-
-enum open_anon_kind {
-  AnonKind_Pipe,
-  AnonKind_SocketConnect,
-  AnonKind_SocketBind,
-  AnonKind_SocketAccept,
+enum open_kind {
+  OpenKind_Object,
+  OpenKind_Path,
+  OpenKind_Pipe,
+  OpenKind_SocketConnect,
+  OpenKind_SocketBind,
+  OpenKind_SocketAccept,
+  OpenKind_PtyServer,
+  OpenKind_PtyClient,
+  OpenKind_Compartment,
 };
 
 enum addr_kind {
@@ -88,13 +91,22 @@ struct socket_address {
   uint32_t flowinfo;
 };
 
+struct socket_bind_info {
+    struct socket_address addr;
+    enum prot_kind prot;
+};
+
+struct object_bind_info {
+    objid id;
+};
+
 /// Open a non-named file. The value pointed to by bind_info is dependent on the kind specified in the first
 /// argument. For pipe, bind_info is ignored. For Socket* kinds, bind_info points to a socket_address.
-extern struct open_result twz_rt_fd_open_anon(enum open_anon_kind kind, uint32_t flags, void *bind_info, size_t bind_info_len, enum prot_kind prot);
+extern struct open_result twz_rt_fd_open(enum open_kind kind, uint32_t flags, void *bind_info, size_t bind_info_len);
 
 /// Reopen a file descriptor with a new anon binding. The anon_kind remains unchanged. The value pointed to by bind_info is dependent on the kind specified in the first
 /// argument. For pipe, bind_info is ignored. For Socket* kinds, bind_info points to a socket_address.
-extern twz_error twz_rt_fd_reopen_anon(descriptor fd, enum open_anon_kind kind, uint32_t flags, void *bind_info, size_t bind_info_len, enum prot_kind prot);
+extern twz_error twz_rt_fd_reopen(descriptor fd, enum open_kind kind, uint32_t flags, void *bind_info, size_t bind_info_len);
 
 /// Close a file descriptor. If the file descriptor is invalid
 /// or already closed, this function does nothing.
@@ -116,6 +128,8 @@ enum fd_kind {
   FdKind_SymLink,
   FdKind_Socket,
   FdKind_Pipe,
+  FdKind_Pty,
+  FdKind_Compartment,
 };
 
 /// Information about a file descriptor.
@@ -152,6 +166,18 @@ const fd_cmd FD_CMD_SHUTDOWN = 3;
 /// Perform a command on the descriptor. The arguments arg and ret are interpreted according to
 /// the command specified.
 extern twz_error twz_rt_fd_cmd(descriptor fd, fd_cmd cmd, void *arg, void *ret);
+
+const size_t BIND_DATA_MAX = 2048;
+
+struct binding_info {
+    enum open_kind kind;
+    descriptor fd;
+    fd_flags flags;
+    size_t bind_len;
+    uint8_t bind_data[BIND_DATA_MAX];
+};
+
+extern size_t twz_rt_fd_read_binds(struct binding_info *binds, size_t nr_binds);
 
 #define NAME_ENTRY_LEN 256
 struct name_entry {

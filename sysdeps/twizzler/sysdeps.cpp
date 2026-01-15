@@ -249,12 +249,12 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
         open_flags |= OPEN_FLAG_READ;
     }
     struct open_info args = {
-        .name = path,
         .len = strlen(path),
         .create = co,
         .flags = open_flags,
     };
-    struct open_result res = twz_rt_fd_open(args);
+    memcpy(&args.name, path, args.len + 1);
+    struct open_result res = twz_rt_fd_open(OpenKind_Path, 0, &args, sizeof(args));
     if (res.err != SUCCESS) {
         return twz_error_errno(res.err);
     }
