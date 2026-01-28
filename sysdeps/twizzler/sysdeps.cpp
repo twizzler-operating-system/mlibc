@@ -252,6 +252,7 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
         .len = strlen(path),
         .create = co,
         .flags = open_flags,
+        .name = {}
     };
     memcpy(&args.name, path, args.len + 1);
     struct open_result res = twz_rt_fd_open(OpenKind_Path, 0, &args, sizeof(args));

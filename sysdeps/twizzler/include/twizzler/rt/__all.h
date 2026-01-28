@@ -4,6 +4,7 @@
 #include "../error.h"
 #include "alloc.h"
 #include "core.h"
+#include "exec.h"
 #include "thread.h"
 #include "handle.h"
 #include "fd.h"
