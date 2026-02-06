@@ -218,6 +218,7 @@ extern struct io_result twz_rt_get_nameroot(enum name_root root, char *path, siz
 
 enum name_resolver {
     NameResolver_Default,
+    NameResolver_Socket,
 };
 
 extern struct objid_result twz_rt_resolve_name(enum name_resolver resolver, const char *name, size_t name_len);

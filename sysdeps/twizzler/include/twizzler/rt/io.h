@@ -108,11 +108,19 @@ const uint32_t IO_REGISTER_SIGNAL = 9;
 
 const uint32_t IO_REGISTER_TERMIOS = 10;
 
+const uint32_t IO_REGISTER_MULTICAST_V4 = 11;
+const uint32_t IO_REGISTER_MULTICAST_V6 = 12;
+const uint32_t IO_REGISTER_MULTICAST_TTL_V4 = 13;
+const uint32_t IO_REGISTER_IO_FLAGS = 14;
+
 const uint64_t STATUS_FLAG_TERMINATED = (1ull << 32);
 const uint64_t STATUS_FLAG_READY = (1ull << 33);
 
 const uint32_t SOCKET_FLAGS_NODELAY = 1;
 const uint32_t SOCKET_FLAGS_ONLYV6 = 2;
+const uint32_t SOCKET_FLAGS_BROADCAST = 4;
+const uint32_t SOCKET_FLAGS_MULTICAST_LOOP_V4 = 8;
+const uint32_t SOCKET_FLAGS_MULTICAST_LOOP_V6 = 0x10;
 
 #ifdef __cplusplus
 }

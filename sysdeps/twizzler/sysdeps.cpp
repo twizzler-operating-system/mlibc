@@ -249,9 +249,9 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
         open_flags |= OPEN_FLAG_READ;
     }
     struct open_info args = {
-        .len = strlen(path),
         .create = co,
         .flags = open_flags,
+        .len = strlen(path),
         .name = {}
     };
     memcpy(&args.name, path, args.len + 1);

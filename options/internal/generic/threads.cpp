@@ -75,9 +75,11 @@ int thread_create(struct __mlibc_thread_data **__restrict thread, const struct _
 #if !defined(__Twizzler__)
 	auto new_tcb = __rtld_allocateTcb();
 #else
+    (void)thread;
+    (void)returns_int;
     Tcb  *new_tcb = nullptr;
 #endif
-	pid_t tid;
+	pid_t tid = 0;
 	struct __mlibc_threadattr attr = {};
 	if (!attrp)
 		thread_attr_init(&attr);
