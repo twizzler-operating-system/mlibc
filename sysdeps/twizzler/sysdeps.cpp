@@ -1,5 +1,6 @@
 #include "include/twizzler/error.h"
 #include "include/twizzler/rt/info.h"
+#include "include/twizzler/rt/types.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -16,6 +17,7 @@
 #include <mlibc/debug.hpp>
 #include <mlibc/all-sysdeps.hpp>
 #include <limits.h>
+#include <stdlib.h>
 
 #include <twizzler/rt/object.h>
 #include <twizzler/rt/fd.h>
@@ -25,6 +27,24 @@
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
+
+
+/*
+__attribute__((weak)) long twz_rt_malloc();
+__attribute__((weak)) long twz_rt_dealloc();
+__attribute__((weak)) long twz_rt_fd_pwrite();
+__attribute__((weak)) long twz_rt_fd_pread();
+__attribute__((weak)) long twz_rt_fd_open();
+__attribute__((weak)) long twz_rt_fd_close();
+__attribute__((weak)) long twz_rt_fd_seek();
+__attribute__((weak)) long twz_rt_fd_get_info();
+__attribute__((weak)) struct system_info twz_rt_get_sysinfo();
+__attribute__((weak)) long twz_rt_exit();
+__attribute__((weak)) long ZdlPv();
+__attribute__((weak)) long ZdlPvj();
+__attribute__((weak)) long ZdlPvm();
+*/
+
 
 static int twz_errno_generic(uint64_t code) {
     switch(code) {

@@ -201,6 +201,9 @@ extern twz_error twz_rt_fd_mkns(const char *name, size_t name_len);
 /// Create a new symlink.
 extern twz_error twz_rt_fd_symlink(const char *name, size_t name_len, const char *target, size_t target_len);
 
+/// Rename a name in the namespace.
+extern twz_error twz_rt_fd_rename(const char *old_name, size_t old_name_len, const char *new_name, size_t new_name_len);
+
 /// Read symlink.
 extern twz_error twz_rt_fd_readlink(const char *name, size_t name_len, char *buf, size_t buf_len, uint64_t *out_buf_len);
 
