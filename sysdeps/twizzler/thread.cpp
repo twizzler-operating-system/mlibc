@@ -23,6 +23,11 @@ int sys_prepare_stack(void **stack, void *entry, void *user_arg, void **tcb, siz
 }
 
 // Declared in options/internal/mlibc/tcb.hpp.
-bool tcb_available_flag = true;
-
+#if !MLIBC_STATIC_BUILD && !MLIBC_BUILDING_RTLD
+	// In non-static builds, libc.so always has a TCB available.
+	//constexpr bool tcb_available_flag = true;
+#else
+	// Otherwise this will be set to true after RTLD has initialized the TCB.
+	bool tcb_available_flag = true;
+#endif
 } // namespace mlibc

@@ -9,6 +9,9 @@
 #	include <asm/ioctls.h>
 #	include <bits/winsize.h>
 #   include <sys/ttydefaults.h>
+#elif __MLIBC_TWIZZLER
+#	include <bits/winsize.h>
+#   include <sys/ttydefaults.h>
 #endif
 
 #ifdef __cplusplus

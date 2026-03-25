@@ -280,6 +280,7 @@ elif host_machine.system() == 'menix'
 elif host_machine.system() == 'twizzler'
 	rtld_include_dirs += include_directories('sysdeps/twizzler/include')
 	libc_include_dirs += include_directories('sysdeps/twizzler/include')
+    mlibc_conf.set10('__MLIBC_TWIZZLER', true)
 	subdir('sysdeps/twizzler')
 # ANCHOR: demo-sysdeps
 elif host_machine.system() == 'demo'
@@ -512,6 +513,10 @@ subdir('options/linux-signalfd')
 
 rtlib_deps = []
 
+if host_machine.system() == 'twizzler'
+    mlibc_link_args += ['-Wl,--allow-shlib-undefined', '-Wl,--warn-unresolved-symbols', '-shared']
+endif
+
 if not headers_only
 	if libgcc_dependency
 		cpp_compiler = meson.get_compiler('cpp')
@@ -534,11 +539,13 @@ if not headers_only
 		'-DMLIBC_BUILDING_RTLD',
 		'-Wno-extern-c-compat',
 		'-Wno-unknown-pragmas',
+		'-fPIC',
 	] + mlibc_c_args
 
 	libc_cpp_args = [
 		'-Wno-unknown-pragmas',
 		'-DFRG_HAVE_LIBC',
+		'-fPIC',
 	] + mlibc_c_args
 
 	if c_compiler.get_id() == 'clang'
@@ -582,14 +589,14 @@ if not headers_only
 		)
 	endif
 	if library_type in ['shared', 'both']
-		ld_shared_lib = shared_library(ld_library_name, rtld_sources + rtld_dso_sources,
-			name_prefix: '',
-			cpp_args: mlibc_c_args + ld_cpp_args,
-			link_args: mlibc_link_args,
-			include_directories: rtld_include_dirs,
-			dependencies: rtld_deps + rtlib_deps,
-			install: true
-		)
+		#ld_shared_lib = shared_library(ld_library_name, rtld_sources + rtld_dso_sources,
+		#	name_prefix: '',
+		#	cpp_args: mlibc_c_args + ld_cpp_args,
+		#	link_args: mlibc_link_args,
+		#	include_directories: rtld_include_dirs,
+		#	dependencies: rtld_deps + rtlib_deps,
+		#	install: true
+		#)
 		hide_everything_ld = (meson.current_source_dir()
 				      / 'scripts/hide-everything.ld')
 		libc_shared = shared_library('c', libc_all_sources,
@@ -597,7 +604,7 @@ if not headers_only
 			cpp_args: [libc_cpp_args],
 			include_directories: libc_include_dirs,
 			dependencies: libc_deps + rtlib_deps,
-			link_with: [ld_shared_lib],
+			link_with: [],
 			link_whole: libc_sublibs,
 			link_args: ['-Wl,--version-script,' + hide_everything_ld, mlibc_link_args],
 			link_depends: [hide_everything_ld],

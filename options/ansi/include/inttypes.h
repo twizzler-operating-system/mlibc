@@ -6,7 +6,7 @@
 
 /* Even though this is not strictly not-ABI, it is mlibc-printf specific therefore */
 /* gate behind !__MLIBC_ABI_ONLY */
-#ifndef __MLIBC_ABI_ONLY
+//#ifndef __MLIBC_ABI_ONLY
 
 #if UINTPTR_MAX == UINT64_MAX
 #	define __PRIFAST "l"
@@ -179,7 +179,7 @@
 #define SCNxMAX __PRI64 "x"
 #define SCNxPTR __PRIPTR "x"
 
-#endif /* !__MLIBC_ABI_ONLY */
+//#endif /* !__MLIBC_ABI_ONLY */
 
 #ifdef __cplusplus
 extern "C" {

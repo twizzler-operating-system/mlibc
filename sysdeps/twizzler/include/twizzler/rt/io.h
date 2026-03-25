@@ -113,6 +113,8 @@ const uint32_t IO_REGISTER_MULTICAST_V6 = 12;
 const uint32_t IO_REGISTER_MULTICAST_TTL_V4 = 13;
 const uint32_t IO_REGISTER_IO_FLAGS = 14;
 
+const uint32_t IO_REGISTER_WINSIZE = 15;
+
 const uint64_t STATUS_FLAG_TERMINATED = (1ull << 32);
 const uint64_t STATUS_FLAG_READY = (1ull << 33);
 

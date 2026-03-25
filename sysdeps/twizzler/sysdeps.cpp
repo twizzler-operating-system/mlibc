@@ -28,24 +28,6 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 
-
-/*
-__attribute__((weak)) long twz_rt_malloc();
-__attribute__((weak)) long twz_rt_dealloc();
-__attribute__((weak)) long twz_rt_fd_pwrite();
-__attribute__((weak)) long twz_rt_fd_pread();
-__attribute__((weak)) long twz_rt_fd_open();
-__attribute__((weak)) long twz_rt_fd_close();
-__attribute__((weak)) long twz_rt_fd_seek();
-__attribute__((weak)) long twz_rt_fd_get_info();
-__attribute__((weak)) struct system_info twz_rt_get_sysinfo();
-__attribute__((weak)) long twz_rt_exit();
-__attribute__((weak)) long ZdlPv();
-__attribute__((weak)) long ZdlPvj();
-__attribute__((weak)) long ZdlPvm();
-*/
-
-
 static int twz_errno_generic(uint64_t code) {
     switch(code) {
         case NOT_SUPPORTED: return ENOTSUP;
@@ -553,6 +535,10 @@ int sys_isatty(int fd) {
 #include <pthread.h>
 
 int sys_ioctl(int fd, unsigned long request, void *arg, int *result) {
+    switch(request) {
+        case TIOCGWINSZ:
+            return twz_error_errno(twz_rt_fd_get_config(fd, IO_REGISTER_WINSIZE, arg, sizeof(struct winsize)));
+    }
 	return ENOSYS;
 }
 
@@ -629,23 +615,23 @@ int sys_tgkill(int tgid, int tid, int sig) {
 }
 
 int sys_tcgetattr(int fd, struct termios *attr) {
-	return ENOSYS;
+    return twz_error_errno(twz_rt_fd_get_config(fd, IO_REGISTER_TERMIOS, attr, sizeof(*attr)));
 }
 
 int sys_tcsetattr(int fd, int optional_action, const struct termios *attr) {
-	return ENOSYS;
+    return twz_error_errno(twz_rt_fd_set_config(fd, IO_REGISTER_TERMIOS, attr, sizeof(*attr)));
 }
 
 int sys_tcflush(int fd, int queue) {
-	return ENOSYS;
+	return 0;
 }
 
 int sys_tcdrain(int fd) {
-	return ENOSYS;
+	return 0;
 }
 
 int sys_tcflow(int fd, int action) {
-	return ENOSYS;
+	return 0;
 }
 
 int sys_access(const char *path, int mode) {
