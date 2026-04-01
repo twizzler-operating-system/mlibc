@@ -28,6 +28,32 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 
+static bool _systrace = true;
+
+extern "C" void __twz_enable_libc_trace(void) {
+    _systrace = false;
+}
+
+#if 1
+#include<stdio.h>
+#define SYSTRACE(...) do { \
+    if (!_systrace) { \
+        _systrace = true; \
+        char tbuf[258]; \
+        snprintf(tbuf, 258, __VA_ARGS__); \
+        struct io_ctx ctx = {\
+		.flags = 0,\
+		.offset = FD_POS,\
+		.timeout = NO_DURATION,\
+	};\
+        twz_rt_fd_pwrite(2, tbuf, strlen(tbuf), &ctx); \
+        _systrace = false; \
+    } \
+    } while(0)
+#else
+#define SYSTRACE(...)
+#endif
+
 static int twz_errno_generic(uint64_t code) {
     switch(code) {
         case NOT_SUPPORTED: return ENOTSUP;
@@ -204,6 +230,7 @@ int sys_anon_free(void *pointer, size_t size) {
 }
 
 int sys_fadvise(int fd, off_t offset, off_t length, int advice) {
+    SYSTRACE("sys_fadvise(fd=%d, offset=%ld, length=%ld, advice=%d)", fd, offset, length, advice);
     // TODO
 	return 0;
 }
@@ -213,6 +240,8 @@ int sys_open(const char *path, int flags, mode_t mode, int *fd) {
 }
 
 int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
+    SYSTRACE("sys_openat(dirfd=%d, path=%s, flags=%d, mode=%o, fd=%p)", dirfd, path, flags, mode, fd);
+
     (void)mode;
     if (dirfd != AT_FDCWD) {
         return ENOSYS;
@@ -273,7 +302,8 @@ int sys_close(int fd) {
 }
 
 int sys_dup2(int fd, int flags, int newfd) {
-	return ENOSYS;
+    SYSTRACE("sys_dup2(fd=%d, flags=%d, newfd=%d)", fd, flags, newfd);
+    return ENOSYS;
 }
 
 int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
@@ -313,15 +343,23 @@ int sys_readv(int fd, const struct iovec *iovs, int iovc, ssize_t *bytes_read) {
 }
 
 int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
-	struct io_ctx ctx = {
+    char tbuf[258];
+    snprintf(tbuf, 258, "write(%d, %p, %ld)", fd, buffer, size);
+
+    struct io_ctx ctx = {
 		.flags = 0,
 		.offset = FD_POS,
 		.timeout = NO_DURATION,
 	};
+
+    twz_rt_fd_pwrite(2, tbuf, strlen(tbuf), &ctx);
+
 	if (bytes_written != nullptr) {
 		*bytes_written = 0;
 	}
 	struct io_result res = twz_rt_fd_pwrite((descriptor)fd, buffer, size, &ctx);
+	snprintf(tbuf, 258, "write wrote %ld bytes (err = %ld)", res.val, res.err);
+	twz_rt_fd_pwrite(2, tbuf, strlen(tbuf), &ctx);
 	if (res.err == SUCCESS) {
 		if (bytes_written != nullptr) {
 			*bytes_written = (ssize_t)res.val;
@@ -332,6 +370,7 @@ int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
 }
 
 int sys_seek(int fd, off_t offset, int whenc, off_t *new_offset) {
+    SYSTRACE("sys_seek(fd=%d, offset=%ld, whenc=%d, new_offset=%p)", fd, offset, whenc, new_offset);
     whence tw = 0;
     if (whenc == SEEK_SET) {
         tw = WHENCE_START;
@@ -431,6 +470,8 @@ int sys_clock_getres(int clock, time_t *secs, long *nanos) {
 }
 
 int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat *statbuf) {
+    SYSTRACE("sys_stat(fsfdt=%d, fd=%d, path=%s, flags=%d, statbuf=%p)", fsfdt, fd, path, flags, statbuf);
+
     if (fsfdt == mlibc::fsfd_target::fd_path) {
         int e = sys_openat(fd, path, O_RDONLY, 0, &fd);
         if (e != 0) {
@@ -470,6 +511,7 @@ extern "C" void __mlibc_signal_restore_rt(void);
 
 int sys_sigaction(int signum, const struct sigaction *act,
 		struct sigaction *oldact) {
+        SYSTRACE("sys_sigaction(signum=%d, act=%p, oldact=%p)", signum, act, oldact);
 	return 0;
 }
 
@@ -494,7 +536,7 @@ int sys_msg_recv(int sockfd, struct msghdr *msg, int flags, ssize_t *length) {
 }
 
 int sys_fcntl(int fd, int cmd, va_list args, int *result) {
-    sys_libc_log("call to fcntl");
+    SYSTRACE("sys_fcntl(fd=%d, cmd=%d, result=%p)", fd, cmd, result);
 	return ENOSYS;
 }
 
@@ -535,6 +577,8 @@ int sys_isatty(int fd) {
 #include <pthread.h>
 
 int sys_ioctl(int fd, unsigned long request, void *arg, int *result) {
+    SYSTRACE("sys_ioctl(fd=%d, request=%lu, arg=%p, result=%p)", fd, request, arg, result);
+
     switch(request) {
         case TIOCGWINSZ:
             return twz_error_errno(twz_rt_fd_get_config(fd, IO_REGISTER_WINSIZE, arg, sizeof(struct winsize)));
@@ -548,6 +592,8 @@ int sys_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
 int sys_pselect(int nfds, fd_set *readfds, fd_set *writefds,
 		fd_set *exceptfds, const struct timespec *timeout, const sigset_t *sigmask, int *num_events) {
+        SYSTRACE("sys_pselect(nfds=%d, readfds=%p, writefds=%p, exceptfds=%p, timeout=%p, sigmask=%p, num_events=%p)",
+            nfds, readfds, writefds, exceptfds, timeout, sigmask, num_events);
 	return ENOSYS;
 }
 
@@ -560,6 +606,7 @@ int sys_fork(pid_t *child) {
 }
 
 int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret_pid) {
+    SYSTRACE("sys_waitpid(pid=%d, status=%p, flags=%d, ru=%p, ret_pid=%p)", pid, status, flags, ru, ret_pid);
 	return ENOSYS;
 }
 
@@ -635,12 +682,12 @@ int sys_tcflow(int fd, int action) {
 }
 
 int sys_access(const char *path, int mode) {
-    sys_libc_log("call to access");
+    SYSTRACE("sys_access(path=%s, mode=%d)", path, mode);
 	return ENOSYS;
 }
 
 int sys_faccessat(int dirfd, const char *pathname, int mode, int flags) {
-    sys_libc_log("call to faccessat");
+    SYSTRACE("sys_faccessat(dirfd=%d, pathname=%s, mode=%d, flags=%d)", dirfd, pathname, mode, flags);
 	return ENOSYS;
 }
 
@@ -717,19 +764,25 @@ int sys_pread(int fd, void *buf, size_t n, off_t off, ssize_t *bytes_read) {
 		return 0;
 	}
 	return twz_error_errno(res.err);
-	return ENOSYS;
 }
 
 int sys_pwrite(int fd, const void *buf, size_t n, off_t off, ssize_t *bytes_written) {
+    char tbuf[258];
+    snprintf(tbuf, 258, "pwrite(%d, %p, %ld, %ld)", fd, buf, n, off);
+
    	struct io_ctx ctx = {
 		.flags = 0,
 		.offset = off,
 		.timeout = NO_DURATION,
 	};
+    twz_rt_fd_pwrite(2, tbuf, strlen(tbuf), &ctx);
+
 	if (bytes_written != nullptr) {
 		*bytes_written = 0;
 	}
 	struct io_result res = twz_rt_fd_pwrite((descriptor)fd, buf, n, &ctx);
+	snprintf(tbuf, 258, "pwrite wrote %ld bytes (err = %ld)", res.val, res.err);
+	twz_rt_fd_pwrite(2, tbuf, strlen(tbuf), &ctx);
 	if (res.err == SUCCESS) {
 		if (bytes_written != nullptr) {
 			*bytes_written = (ssize_t)res.val;
@@ -814,12 +867,14 @@ int sys_futex_wake(int *pointer) {
 }
 
 int sys_mkdir(const char *path, mode_t mode) {
+    SYSTRACE("sys_mkdir(path=%s, mode=%o)", path, mode);
     sys_libc_log("call to mkdir");
 	return ENOSYS;
 }
 
 
 int sys_mkdirat(int dirfd, const char *path, mode_t mode) {
+    SYSTRACE("sys_mkdirat(dirfd=%d, path=%s, mode=%o)", dirfd, path, mode);
     sys_libc_log("call to mkdirat");
 	return ENOSYS;
 }
@@ -845,12 +900,12 @@ int sys_umask(mode_t mode, mode_t *old) {
 }
 
 int sys_chdir(const char *path) {
-    sys_libc_log("call to chdir");
+    SYSTRACE("sys_chdir(path=%s)", path);
 	return ENOSYS;
 }
 
 int sys_fchdir(int fd) {
-    sys_libc_log("call to fchdir");
+    SYSTRACE("sys_fchdir(fd=%d)", fd);
 	return ENOSYS;
 }
 
@@ -915,11 +970,11 @@ void sys_sync() {
 }
 
 int sys_fsync(int fd) {
-	return ENOSYS;
+	return 0;
 }
 
 int sys_fdatasync(int fd) {
-	return ENOSYS;
+	return 0;
 }
 
 int sys_getrandom(void *buffer, size_t length, int flags, ssize_t *bytes_written) {

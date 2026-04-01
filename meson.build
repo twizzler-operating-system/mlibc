@@ -513,8 +513,10 @@ subdir('options/linux-signalfd')
 
 rtlib_deps = []
 
-if host_machine.system() == 'twizzler'
-    mlibc_link_args += ['-Wl,--allow-shlib-undefined', '-Wl,--warn-unresolved-symbols', '-shared']
+if not headers_only
+    if host_machine.system() == 'twizzler'
+        mlibc_link_args += ['-Wl,--allow-shlib-undefined', '-Wl,--warn-unresolved-symbols', '-shared']
+    endif
 endif
 
 if not headers_only

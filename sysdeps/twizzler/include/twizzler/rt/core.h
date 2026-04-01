@@ -17,6 +17,8 @@ struct basic_aux {
   char **args;
   /// Environment pointer
   char **env;
+  /// entry point
+  uintptr_t entry;
 };
 
 /// Return info from rust libstd
@@ -69,6 +71,8 @@ struct runtime_info {
   size_t argc;
   /// Environment pointer
   char **envp;
+  /// Entry point for ELF file
+  size_t entry;
   union init_info_ptrs init_info;
 };
 
@@ -100,7 +104,7 @@ void twz_rt_set_upcall_handler(void (*handler)(void *frame, const void *data));
 
 struct option_exit_code twz_rt_pre_main_hook(void);
 void twz_rt_post_main_hook(void);
-_Noreturn void twz_rt_runtime_entry(const struct runtime_info *arg, struct basic_return (*std_entry)(struct basic_aux));
+_Noreturn void twz_rt_runtime_entry(const struct runtime_info *arg, struct basic_return (*std_entry)(struct basic_aux), uintptr_t main);
 
 #ifdef __cplusplus
 }

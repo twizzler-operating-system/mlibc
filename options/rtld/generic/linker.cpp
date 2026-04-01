@@ -1384,7 +1384,6 @@ void initTlsObjects(Tcb *tcb, const frg::vector<SharedObject *, MemoryAllocator>
 		}
 	}
 }
-
 Tcb *allocateTcb() {
 	size_t tlsInitialSize = runtimeTlsMap->initialLimit;
 
@@ -1428,13 +1427,7 @@ Tcb *allocateTcb() {
 
 	Tcb *tcb_ptr = new ((char *)tcbAddress) Tcb;
 	tcb_ptr->selfPointer = tcb_ptr;
-
-	tcb_ptr->stackCanary = __stack_chk_guard;
-	tcb_ptr->cancelBits = tcbCancelEnableBit;
-	tcb_ptr->didExit = 0;
-	tcb_ptr->isJoinable = 1;
-	memset(&tcb_ptr->returnValue, 0, sizeof(tcb_ptr->returnValue));
-	tcb_ptr->localKeys = frg::construct<frg::array<Tcb::LocalKey, PTHREAD_KEYS_MAX>>(getAllocator());
+	initBasicTcb(tcb_ptr);
 	tcb_ptr->dtvSize = runtimeTlsMap->indices.size();
 	tcb_ptr->dtvPointers = frg::construct_n<void *>(getAllocator(), runtimeTlsMap->indices.size());
 	memset(tcb_ptr->dtvPointers, 0, sizeof(void *) * runtimeTlsMap->indices.size());
@@ -1452,6 +1445,7 @@ Tcb *allocateTcb() {
 
 	return tcb_ptr;
 }
+
 
 void *accessDtv(SharedObject *object) {
 	Tcb *tcb_ptr = mlibc::get_current_tcb();
@@ -2308,4 +2302,3 @@ void Loader::_processLazyRelocations(SharedObject *object) {
 		}
 	}
 }
-
