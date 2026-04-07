@@ -22,8 +22,11 @@ const int64_t FUTEX_WAKE_ALL = -1;
 
 /// Yield the thread now.
 extern void twz_rt_yield_now(void);
-/// Set the name of the calling thread.
+/// Set the name of the calling thread. Must be a C string.
 extern void twz_rt_set_name(const char *name);
+/// Get the name of the calling thread. A slice of length *len is filled, and *len is updated to
+/// contain the length actually used. The result is also a C string.
+extern void twz_rt_get_name(const void *tcb, char *name, size_t *len);
 /// Sleep the calling thread for specified duration.
 extern void twz_rt_sleep(struct duration dur);
 

@@ -24,6 +24,7 @@
 #include <twizzler/rt/io.h>
 #include <twizzler/rt/alloc.h>
 #include <twizzler/rt/core.h>
+#include <twizzler/rt/thread.h>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
@@ -41,6 +42,7 @@ extern "C" void __twz_enable_libc_trace(void) {
         _systrace = true; \
         char tbuf[258]; \
         snprintf(tbuf, 258, __VA_ARGS__); \
+        strncat(tbuf, "\n", 258); \
         struct io_ctx ctx = {\
 		.flags = 0,\
 		.offset = FD_POS,\
@@ -343,23 +345,16 @@ int sys_readv(int fd, const struct iovec *iovs, int iovc, ssize_t *bytes_read) {
 }
 
 int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
-    char tbuf[258];
-    snprintf(tbuf, 258, "write(%d, %p, %ld)", fd, buffer, size);
-
-    struct io_ctx ctx = {
+    SYSTRACE("write(%d, %p, %ld)", fd, buffer, size);
+   	struct io_ctx ctx = {
 		.flags = 0,
 		.offset = FD_POS,
 		.timeout = NO_DURATION,
 	};
-
-    twz_rt_fd_pwrite(2, tbuf, strlen(tbuf), &ctx);
-
 	if (bytes_written != nullptr) {
 		*bytes_written = 0;
 	}
 	struct io_result res = twz_rt_fd_pwrite((descriptor)fd, buffer, size, &ctx);
-	snprintf(tbuf, 258, "write wrote %ld bytes (err = %ld)", res.val, res.err);
-	twz_rt_fd_pwrite(2, tbuf, strlen(tbuf), &ctx);
 	if (res.err == SUCCESS) {
 		if (bytes_written != nullptr) {
 			*bytes_written = (ssize_t)res.val;
@@ -465,6 +460,11 @@ int sys_clock_get(int clock, time_t *secs, long *nanos) {
     return 0;
 }
 
+int sys_thread_getname(Tcb *tcb, char *name, size_t len) {
+    twz_rt_get_name(tcb, name, &len);
+    return 0;
+}
+
 int sys_clock_getres(int clock, time_t *secs, long *nanos) {
 	return ENOSYS;
 }
@@ -474,6 +474,11 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat
 
     if (fsfdt == mlibc::fsfd_target::fd_path) {
         int e = sys_openat(fd, path, O_RDONLY, 0, &fd);
+        if (e != 0) {
+            return e;
+        }
+    } else if (fsfdt == mlibc::fsfd_target::path) {
+        int e = sys_openat(AT_FDCWD, path, O_RDONLY, 0, &fd);
         if (e != 0) {
             return e;
         }
@@ -767,22 +772,17 @@ int sys_pread(int fd, void *buf, size_t n, off_t off, ssize_t *bytes_read) {
 }
 
 int sys_pwrite(int fd, const void *buf, size_t n, off_t off, ssize_t *bytes_written) {
-    char tbuf[258];
-    snprintf(tbuf, 258, "pwrite(%d, %p, %ld, %ld)", fd, buf, n, off);
+    SYSTRACE("pwrite(%d, %p, %ld, %ld)", fd, buf, n, off);
 
    	struct io_ctx ctx = {
 		.flags = 0,
 		.offset = off,
 		.timeout = NO_DURATION,
 	};
-    twz_rt_fd_pwrite(2, tbuf, strlen(tbuf), &ctx);
-
 	if (bytes_written != nullptr) {
 		*bytes_written = 0;
 	}
 	struct io_result res = twz_rt_fd_pwrite((descriptor)fd, buf, n, &ctx);
-	snprintf(tbuf, 258, "pwrite wrote %ld bytes (err = %ld)", res.val, res.err);
-	twz_rt_fd_pwrite(2, tbuf, strlen(tbuf), &ctx);
 	if (res.err == SUCCESS) {
 		if (bytes_written != nullptr) {
 			*bytes_written = (ssize_t)res.val;
