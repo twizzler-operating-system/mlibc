@@ -451,7 +451,6 @@ int sys_vm_protect(void *pointer, size_t size, int prot) {
 }
 
 // All remaining functions are disabled in ldso.
-#ifndef MLIBC_BUILDING_RTLD
 
 int sys_clock_get(int clock, time_t *secs, long *nanos) {
     // TODO
@@ -460,7 +459,7 @@ int sys_clock_get(int clock, time_t *secs, long *nanos) {
     return 0;
 }
 
-int sys_thread_getname(Tcb *tcb, char *name, size_t len) {
+int sys_thread_getname(void *tcb, char *name, size_t len) {
     twz_rt_get_name(tcb, name, &len);
     return 0;
 }
@@ -811,7 +810,6 @@ int sys_sysconf(int num, long *ret) {
 	}
 	return 0;
 }
-#endif // __MLIBC_POSIX_OPTION
 //
 pid_t sys_getpid() {
 	return 1;
