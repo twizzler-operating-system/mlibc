@@ -734,13 +734,12 @@ int sys_setpriority(int which, id_t who, int prio) {
 }
 
 int sys_open_dir(const char *path, int *fd) {
-    sys_libc_log("call to open dir");
-	return ENOSYS;
+	return sys_open(path, O_RDONLY | O_DIRECTORY, 0, fd);
 }
 
 int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_read) {
-    sys_libc_log("call to read entries");
-	return ENOSYS;
+	*bytes_read = 0;
+	return 0;
 }
 
 int sys_uname(struct utsname *buf) {
