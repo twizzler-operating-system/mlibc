@@ -126,6 +126,8 @@ int thread_create(struct __mlibc_thread_data **__restrict thread, const struct _
 	__atomic_store_n(&new_tcb->tid, tid, __ATOMIC_RELAXED);
 	mlibc::sys_futex_wake(&new_tcb->tid);
 
+	MLIBC_MISSING_SYSDEP();
+
 	return ENOSYS;
 }
 

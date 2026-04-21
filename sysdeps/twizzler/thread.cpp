@@ -40,11 +40,14 @@ extern "C" void __mlibc_enter_thread(void *entry, void *user_arg) {
 	// TODO
 }
 
+#include "sysdeps.h"
+
 namespace mlibc {
 
 static constexpr size_t default_stacksize = 0x200000;
 
 int sys_prepare_stack(void **stack, void *entry, void *user_arg, void **tcb, size_t *stack_size, size_t *guard_size, void **stack_base) {
+	SYSTRACE("sys_prepare_stack(stack=%p, entry=%p, user_arg=%p, tcb=%p, stack_size=%p, guard_size=%p, stack_base=%p)", stack, entry, user_arg, tcb, stack_size, guard_size, stack_base);
 	return -ENOSYS;
 }
 

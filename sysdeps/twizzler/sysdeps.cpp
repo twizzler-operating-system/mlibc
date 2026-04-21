@@ -6,6 +6,7 @@
 #include <limits.h>
 #include <sys/errno.h>
 #include <sys/mman.h>
+#include <dirent.h>
 
 #include <type_traits>
 
@@ -29,32 +30,32 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 
-static bool _systrace = true;
-
-extern "C" void __twz_enable_libc_trace(void) {
+extern "C" {
+bool _systrace = true;
+void __twz_enable_libc_trace(void) {
     _systrace = false;
 }
+}
+#include "sysdeps.h"
 
-#if 1
-#include<stdio.h>
-#define SYSTRACE(...) do { \
-    if (!_systrace) { \
-        _systrace = true; \
-        char tbuf[258]; \
-        snprintf(tbuf, 258, __VA_ARGS__); \
-        strncat(tbuf, "\n", 258); \
-        struct io_ctx ctx = {\
-		.flags = 0,\
-		.offset = FD_POS,\
-		.timeout = NO_DURATION,\
-	};\
-        twz_rt_fd_pwrite(2, tbuf, strlen(tbuf), &ctx); \
-        _systrace = false; \
-    } \
-    } while(0)
-#else
-#define SYSTRACE(...)
-#endif
+
+static inline int32_t objid_to_ino(unsigned __int128 id) {
+    if (id == 1) {
+        return 0;
+    }
+    
+    uint64_t hi = (uint64_t)(id >> 64);
+    uint64_t lo = (uint64_t)id;
+    
+    if (hi == (1ULL << 63)) {
+        uint32_t ino = (uint32_t)(lo & ~(1ULL << 63));
+        return (int32_t)ino;
+    }
+    
+    return -1;  // Represents failure/None case
+}
+
+
 
 static int twz_errno_generic(uint64_t code) {
     switch(code) {
@@ -214,11 +215,13 @@ void sys_libc_panic() {
 }
 
 int sys_tcb_set(void *pointer) {
+    SYSTRACE("sys_tcb_set(pointer=%p)", pointer);
     mlibc::sys_libc_log("tried to set TCB from within Twizzler-managed libc");
 	return 0;
 }
 
 int sys_anon_allocate(size_t size, void **pointer) {
+    SYSTRACE("sys_anon_allocate(size=%ld, pointer=%p)", size, pointer);
     *pointer = twz_rt_malloc(size, 128, ZERO_MEMORY);
     if (*pointer == NULL) {
         return -1;
@@ -227,6 +230,7 @@ int sys_anon_allocate(size_t size, void **pointer) {
 }
 
 int sys_anon_free(void *pointer, size_t size) {
+    SYSTRACE("sys_anon_free(pointer=%p, size=%ld)", pointer, size);
     twz_rt_dealloc(pointer, size, 128, 0);
 	return 0;
 }
@@ -234,11 +238,16 @@ int sys_anon_free(void *pointer, size_t size) {
 int sys_fadvise(int fd, off_t offset, off_t length, int advice) {
     SYSTRACE("sys_fadvise(fd=%d, offset=%ld, length=%ld, advice=%d)", fd, offset, length, advice);
     // TODO
-	return 0;
+	int result = 0;
+	SYSTRACE("sys_fadvise returning %d", result);
+	return result;
 }
 
 int sys_open(const char *path, int flags, mode_t mode, int *fd) {
-    return sys_openat(AT_FDCWD, path, flags, mode, fd);
+    SYSTRACE("sys_open(path=%s, flags=%d, mode=%o, fd=%p)", path, flags, mode, fd);
+    int result = sys_openat(AT_FDCWD, path, flags, mode, fd);
+    SYSTRACE("sys_open returning %d", result);
+    return result;
 }
 
 int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
@@ -246,6 +255,8 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
 
     (void)mode;
     if (dirfd != AT_FDCWD) {
+        SYSTRACE("sys_openat: dirfd != AT_FDCWD");
+        mlibc::sys_libc_log("sys_openat: dirfd != AT_FDCWD");
         return ENOSYS;
     }
     struct create_options co = {
@@ -299,16 +310,22 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
 }
 
 int sys_close(int fd) {
+    SYSTRACE("sys_close(fd=%d)", fd);
     twz_rt_fd_close(fd);
-    return 0;
+    int result = 0;
+    SYSTRACE("sys_close returning %d", result);
+    return result;
 }
 
 int sys_dup2(int fd, int flags, int newfd) {
     SYSTRACE("sys_dup2(fd=%d, flags=%d, newfd=%d)", fd, flags, newfd);
-    return ENOSYS;
+    int result = ENOSYS;
+    SYSTRACE("sys_dup2 returning %d", result);
+    return result;
 }
 
 int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
+    SYSTRACE("sys_read(fd=%d, buffer=%p, size=%ld, bytes_read=%p)", fd, buffer, size, bytes_read);
    	struct io_ctx ctx = {
 		.flags = 0,
 		.offset = FD_POS,
@@ -328,6 +345,7 @@ int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
 }
 
 int sys_readv(int fd, const struct iovec *iovs, int iovc, ssize_t *bytes_read) {
+    SYSTRACE("sys_readv(fd=%d, iovs=%p, iovc=%d, bytes_read=%p)", fd, iovs, iovc, bytes_read);
     if (bytes_read != nullptr) {
 		*bytes_read = 0;
 	}
@@ -345,7 +363,7 @@ int sys_readv(int fd, const struct iovec *iovs, int iovc, ssize_t *bytes_read) {
 }
 
 int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
-    SYSTRACE("write(%d, %p, %ld)", fd, buffer, size);
+    //SYSTRACE("write(%d, %p, %ld)", fd, buffer, size);
    	struct io_ctx ctx = {
 		.flags = 0,
 		.offset = FD_POS,
@@ -387,23 +405,38 @@ int sys_seek(int fd, off_t offset, int whenc, off_t *new_offset) {
 }
 
 int sys_chmod(const char *pathname, mode_t mode) {
-	return ENOSYS;
+    SYSTRACE("sys_chmod(pathname=%s, mode=%o)", pathname, mode);
+	int result = ENOSYS;
+	SYSTRACE("sys_chmod returning %d", result);
+	return result;
 }
 
 int sys_fchmod(int fd, mode_t mode) {
-	return ENOSYS;
+    SYSTRACE("sys_fchmod(fd=%d, mode=%o)", fd, mode);
+	int result = ENOSYS;
+	SYSTRACE("sys_fchmod returning %d", result);
+	return result;
 }
 
 int sys_fchmodat(int fd, const char *pathname, mode_t mode, int flags) {
-	return ENOSYS;
+    SYSTRACE("sys_fchmodat(fd=%d, pathname=%s, mode=%o, flags=%d)", fd, pathname, mode, flags);
+	int result = ENOSYS;
+	SYSTRACE("sys_fchmodat returning %d", result);
+	return result;
 }
 
 int sys_fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags) {
-	return ENOSYS;
+    SYSTRACE("sys_fchownat(dirfd=%d, pathname=%s, owner=%d, group=%d, flags=%d)", dirfd, pathname, owner, group, flags);
+	int result = ENOSYS;
+	SYSTRACE("sys_fchownat returning %d", result);
+	return result;
 }
 
 int sys_utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags) {
-	return ENOSYS;
+    SYSTRACE("sys_utimensat(dirfd=%d, pathname=%s, times=%p, flags=%d)", dirfd, pathname, times, flags);
+	int result = ENOSYS;
+	SYSTRACE("sys_utimensat returning %d", result);
+	return result;
 }
 
 int sys_vm_map(void *hint, size_t size, int prot, int flags,
@@ -437,22 +470,29 @@ int sys_vm_map(void *hint, size_t size, int prot, int flags,
 }
 
 int sys_vm_unmap(void *pointer, size_t size) {
+    SYSTRACE("sys_vm_unmap(pointer=%p, size=%ld)", pointer, size);
 	/*
 	auto ret = do_syscall(SYS_munmap, pointer, size);
 	if(int e = sc_error(ret); e)
 		return e;
 	return 0;
 	*/
-	return 0;
+	int result = 0;
+	SYSTRACE("sys_vm_unmap returning %d", result);
+	return result;
 }
 
 int sys_vm_protect(void *pointer, size_t size, int prot) {
-	return 0;
+    SYSTRACE("sys_vm_protect(pointer=%p, size=%ld, prot=%d)", pointer, size, prot);
+	int result = 0;
+	SYSTRACE("sys_vm_protect returning %d", result);
+	return result;
 }
 
 // All remaining functions are disabled in ldso.
 
 int sys_clock_get(int clock, time_t *secs, long *nanos) {
+    SYSTRACE("sys_clock_get(clock=%d, secs=%p, nanos=%p)", clock, secs, nanos);
     // TODO
     *secs = 0;
     *nanos = 0;
@@ -460,16 +500,22 @@ int sys_clock_get(int clock, time_t *secs, long *nanos) {
 }
 
 int sys_thread_getname(void *tcb, char *name, size_t len) {
+    SYSTRACE("sys_thread_getname(tcb=%p, name=%p, len=%ld)", tcb, name, len);
     twz_rt_get_name(tcb, name, &len);
     return 0;
 }
 
 int sys_clock_getres(int clock, time_t *secs, long *nanos) {
+    SYSTRACE("sys_clock_getres(clock=%d, secs=%p, nanos=%p)", clock, secs, nanos);
 	return ENOSYS;
 }
 
 int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat *statbuf) {
     SYSTRACE("sys_stat(fsfdt=%d, fd=%d, path=%s, flags=%d, statbuf=%p)", fsfdt, fd, path, flags, statbuf);
+    if(flags & AT_SYMLINK_NOFOLLOW) {
+        mlibc::sys_libc_log("symlink stat not supported in Twizzler");
+        return ENOTSUP;
+    }
 
     if (fsfdt == mlibc::fsfd_target::fd_path) {
         int e = sys_openat(fd, path, O_RDONLY, 0, &fd);
@@ -487,7 +533,7 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat
         return EBADF;
     }
     statbuf->st_dev = 0;
-    statbuf->st_ino = 0;
+    statbuf->st_ino = objid_to_ino(info.id);
     statbuf->st_mode = info.unix_mode;
     statbuf->st_nlink = 1;
     statbuf->st_uid = 0;
@@ -501,11 +547,13 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat
 }
 
 int sys_statfs(const char *path, struct statfs *buf) {
+    SYSTRACE("sys_statfs(path=%s, buf=%p)", path, buf);
     sys_libc_log("call to statfs");
 	return ENOSYS;
 }
 
 int sys_fstatfs(int fd, struct statfs *buf) {
+    SYSTRACE("sys_fstatfs(fd=%d, buf=%p)", fd, buf);
     sys_libc_log("call to fstatfs");
 	return ENOSYS;
 }
@@ -520,43 +568,67 @@ int sys_sigaction(int signum, const struct sigaction *act,
 }
 
 int sys_socket(int domain, int type, int protocol, int *fd) {
-	return ENOSYS;
+    SYSTRACE("sys_socket(domain=%d, type=%d, protocol=%d, fd=%p)", domain, type, protocol, fd);
+	int result = ENOSYS;
+	SYSTRACE("sys_socket returning %d", result);
+	return result;
 }
 
 int sys_msg_send(int sockfd, const struct msghdr *msg, int flags, ssize_t *length) {
-	return ENOSYS;
+    SYSTRACE("sys_msg_send(sockfd=%d, msg=%p, flags=%d, length=%p)", sockfd, msg, flags, length);
+	int result = ENOSYS;
+	SYSTRACE("sys_msg_send returning %d", result);
+	return result;
 }
 
 ssize_t sys_sendto(int fd, const void *buffer, size_t size, int flags, const struct sockaddr *sock_addr, socklen_t addr_length, ssize_t *length) {
+    SYSTRACE("sys_sendto(fd=%d, buffer=%p, size=%ld, flags=%d, sock_addr=%p, addr_length=%d, length=%p)", fd, buffer, size, flags, sock_addr, addr_length, length);
 	return ENOSYS;
 }
 
 ssize_t sys_recvfrom(int fd, void *buffer, size_t size, int flags, struct sockaddr *sock_addr, socklen_t *addr_length, ssize_t *length) {
+    SYSTRACE("sys_recvfrom(fd=%d, buffer=%p, size=%ld, flags=%d, sock_addr=%p, addr_length=%p, length=%p)", fd, buffer, size, flags, sock_addr, addr_length, length);
 	return ENOSYS;
 }
 
 int sys_msg_recv(int sockfd, struct msghdr *msg, int flags, ssize_t *length) {
-	return ENOSYS;
+    SYSTRACE("sys_msg_recv(sockfd=%d, msg=%p, flags=%d, length=%p)", sockfd, msg, flags, length);
+	int result = ENOSYS;
+	SYSTRACE("sys_msg_recv returning %d", result);
+	return result;
 }
 
 int sys_fcntl(int fd, int cmd, va_list args, int *result) {
     SYSTRACE("sys_fcntl(fd=%d, cmd=%d, result=%p)", fd, cmd, result);
-	return ENOSYS;
+	*result = 0;
+	switch(cmd) {
+		case F_GETFL:
+			*result = O_RDWR;
+			break;
+	}
+	return 0;
 }
 
 int sys_getcwd(char *buf, size_t size) {
+    SYSTRACE("sys_getcwd(buf=%p, size=%ld)", buf, size);
     *buf = '/';
     *(buf + 1) = 0;
-    return 0;
+    int result = 0;
+    SYSTRACE("sys_getcwd returning %d", result);
+    return result;
     //sys_libc_log("call to getcwd");
 	//return ENOSYS;
 }
 
 int sys_unlinkat(int dfd, const char *path, int flags) {
-	return ENOSYS;
+    SYSTRACE("sys_unlinkat(dfd=%d, path=%s, flags=%d)", dfd, path, flags);
+	int result = ENOSYS;
+	SYSTRACE("sys_unlinkat returning %d", result);
+	return result;
 }
 
 int sys_sleep(time_t *secs, long *nanos) {
+    SYSTRACE("sys_sleep(secs=%p, nanos=%p)", secs, nanos);
     *secs = 0;
     *nanos = 0;
     // TODO
@@ -564,7 +636,10 @@ int sys_sleep(time_t *secs, long *nanos) {
 }
 
 int sys_isatty(int fd) {
-	return 0;
+    SYSTRACE("sys_isatty(fd=%d)", fd);
+	int result = 0;
+	SYSTRACE("sys_isatty returning %d", result);
+	return result;
 }
 
 #include <net/if.h>
@@ -586,12 +661,16 @@ int sys_ioctl(int fd, unsigned long request, void *arg, int *result) {
     switch(request) {
         case TIOCGWINSZ:
             return twz_error_errno(twz_rt_fd_get_config(fd, IO_REGISTER_WINSIZE, arg, sizeof(struct winsize)));
+        default: *result = 0;
     }
-	return ENOSYS;
+	return 0;
 }
 
 int sys_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-	return ENOSYS;
+    SYSTRACE("sys_connect(sockfd=%d, addr=%p, addrlen=%d)", sockfd, addr, addrlen);
+	int result = ENOSYS;
+	SYSTRACE("sys_connect returning %d", result);
+	return result;
 }
 
 int sys_pselect(int nfds, fd_set *readfds, fd_set *writefds,
@@ -602,11 +681,17 @@ int sys_pselect(int nfds, fd_set *readfds, fd_set *writefds,
 }
 
 int sys_pipe(int *fds, int flags) {
-	return ENOSYS;
+    SYSTRACE("sys_pipe(fds=%p, flags=%d)", fds, flags);
+	int result = ENOSYS;
+	SYSTRACE("sys_pipe returning %d", result);
+	return result;
 }
 
 int sys_fork(pid_t *child) {
-	return ENOSYS;
+    SYSTRACE("sys_fork(child=%p)", child);
+	int result = ENOSYS;
+	SYSTRACE("sys_fork returning %d", result);
+	return result;
 }
 
 int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret_pid) {
@@ -615,142 +700,303 @@ int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret
 }
 
 int sys_execve(const char *path, char *const argv[], char *const envp[]) {
-	return ENOSYS;
+    SYSTRACE("sys_execve(path=%s, argv=%p, envp=%p)", path, argv, envp);
+	int result = ENOSYS;
+	SYSTRACE("sys_execve returning %d", result);
+	return result;
 }
 
 int sys_sigprocmask(int how, const sigset_t *set, sigset_t *old) {
-	return ENOSYS;
+    SYSTRACE("sys_sigprocmask(how=%d, set=%p, old=%p)", how, set, old);
+	int result = ENOSYS;
+	SYSTRACE("sys_sigprocmask returning %d", result);
+	return result;
 }
 
 int sys_setresuid(uid_t ruid, uid_t euid, uid_t suid) {
-	return ENOSYS;
+    SYSTRACE("sys_setresuid(ruid=%d, euid=%d, suid=%d)", ruid, euid, suid);
+	int result = ENOSYS;
+	SYSTRACE("sys_setresuid returning %d", result);
+	return result;
 }
 
 int sys_setresgid(gid_t rgid, gid_t egid, gid_t sgid) {
-	return ENOSYS;
+    SYSTRACE("sys_setresgid(rgid=%d, egid=%d, sgid=%d)", rgid, egid, sgid);
+	int result = ENOSYS;
+	SYSTRACE("sys_setresgid returning %d", result);
+	return result;
 }
 
 int sys_getresuid(uid_t *ruid, uid_t *euid, uid_t *suid) {
-	return ENOSYS;
+    SYSTRACE("sys_getresuid(ruid=%p, euid=%p, suid=%p)", ruid, euid, suid);
+	int result = ENOSYS;
+	SYSTRACE("sys_getresuid returning %d", result);
+	return result;
 }
 
 int sys_getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid) {
-	return ENOSYS;
+    SYSTRACE("sys_getresgid(rgid=%p, egid=%p, sgid=%p)", rgid, egid, sgid);
+	int result = ENOSYS;
+	SYSTRACE("sys_getresgid returning %d", result);
+	return result;
 }
 
 int sys_setreuid(uid_t ruid, uid_t euid) {
-	return ENOSYS;
+    SYSTRACE("sys_setreuid(ruid=%d, euid=%d)", ruid, euid);
+	int result = ENOSYS;
+	SYSTRACE("sys_setreuid returning %d", result);
+	return result;
 }
 
 int sys_setregid(gid_t rgid, gid_t egid) {
-	return ENOSYS;
+    SYSTRACE("sys_setregid(rgid=%d, egid=%d)", rgid, egid);
+	int result = ENOSYS;
+	SYSTRACE("sys_setregid returning %d", result);
+	return result;
 }
 
 int sys_sysinfo(struct sysinfo *info) {
-	return ENOSYS;
+    SYSTRACE("sys_sysinfo(info=%p)", info);
+	int result = ENOSYS;
+	SYSTRACE("sys_sysinfo returning %d", result);
+	return result;
 }
 
 void sys_yield() {
+    SYSTRACE("sys_yield()");
 	// TODO
 }
 
 int sys_clone(void *tcb, pid_t *pid_out, void *stack) {
-	return ENOSYS;
+    SYSTRACE("sys_clone(tcb=%p, pid_out=%p, stack=%p)", tcb, pid_out, stack);
+	int result = ENOSYS;
+	SYSTRACE("sys_clone returning %d", result);
+	return result;
 }
 
 extern "C" const char __mlibc_syscall_begin[1];
 extern "C" const char __mlibc_syscall_end[1];
 
 int sys_tgkill(int tgid, int tid, int sig) {
-	return ENOSYS;
+    SYSTRACE("sys_tgkill(tgid=%d, tid=%d, sig=%d)", tgid, tid, sig);
+	int result = ENOSYS;
+	SYSTRACE("sys_tgkill returning %d", result);
+	return result;
 }
 
 int sys_tcgetattr(int fd, struct termios *attr) {
-    return twz_error_errno(twz_rt_fd_get_config(fd, IO_REGISTER_TERMIOS, attr, sizeof(*attr)));
+    SYSTRACE("sys_tcgetattr(fd=%d, attr=%p)", fd, attr);
+    int result = twz_error_errno(twz_rt_fd_get_config(fd, IO_REGISTER_TERMIOS, attr, sizeof(*attr)));
+    SYSTRACE("sys_tcgetattr returning %d", result);
+    return result;
 }
 
 int sys_tcsetattr(int fd, int optional_action, const struct termios *attr) {
-    return twz_error_errno(twz_rt_fd_set_config(fd, IO_REGISTER_TERMIOS, attr, sizeof(*attr)));
+    SYSTRACE("sys_tcsetattr(fd=%d, optional_action=%d, attr=%p)", fd, optional_action, attr);
+    int result = twz_error_errno(twz_rt_fd_set_config(fd, IO_REGISTER_TERMIOS, attr, sizeof(*attr)));
+    SYSTRACE("sys_tcsetattr returning %d", result);
+    return result;
 }
 
 int sys_tcflush(int fd, int queue) {
-	return 0;
+    SYSTRACE("sys_tcflush(fd=%d, queue=%d)", fd, queue);
+	int result = 0;
+	SYSTRACE("sys_tcflush returning %d", result);
+	return result;
 }
 
 int sys_tcdrain(int fd) {
-	return 0;
+    SYSTRACE("sys_tcdrain(fd=%d)", fd);
+	int result = 0;
+	SYSTRACE("sys_tcdrain returning %d", result);
+	return result;
 }
 
 int sys_tcflow(int fd, int action) {
-	return 0;
+    SYSTRACE("sys_tcflow(fd=%d, action=%d)", fd, action);
+	int result = 0;
+	SYSTRACE("sys_tcflow returning %d", result);
+	return result;
 }
 
 int sys_access(const char *path, int mode) {
     SYSTRACE("sys_access(path=%s, mode=%d)", path, mode);
-	return ENOSYS;
+	return 0;
 }
 
 int sys_faccessat(int dirfd, const char *pathname, int mode, int flags) {
     SYSTRACE("sys_faccessat(dirfd=%d, pathname=%s, mode=%d, flags=%d)", dirfd, pathname, mode, flags);
-	return ENOSYS;
+	return 0;
 }
 
 int sys_accept(int fd, int *newfd, struct sockaddr *addr_ptr, socklen_t *addr_length, int flags) {
-	return ENOSYS;
+    SYSTRACE("sys_accept(fd=%d, newfd=%p, addr_ptr=%p, addr_length=%p, flags=%d)", fd, newfd, addr_ptr, addr_length, flags);
+	int result = ENOSYS;
+	SYSTRACE("sys_accept returning %d", result);
+	return result;
 }
 
 int sys_bind(int fd, const struct sockaddr *addr_ptr, socklen_t addr_length) {
-	return ENOSYS;
+    SYSTRACE("sys_bind(fd=%d, addr_ptr=%p, addr_length=%d)", fd, addr_ptr, addr_length);
+	int result = ENOSYS;
+	SYSTRACE("sys_bind returning %d", result);
+	return result;
 }
 
 int sys_setsockopt(int fd, int layer, int number, const void *buffer, socklen_t size) {
-	return ENOSYS;
+    SYSTRACE("sys_setsockopt(fd=%d, layer=%d, number=%d, buffer=%p, size=%d)", fd, layer, number, buffer, size);
+	int result = ENOSYS;
+	SYSTRACE("sys_setsockopt returning %d", result);
+	return result;
 }
 
 int sys_sockname(int fd, struct sockaddr *addr_ptr, socklen_t max_addr_length,
 		socklen_t *actual_length) {
-	return ENOSYS;
+    SYSTRACE("sys_sockname(fd=%d, addr_ptr=%p, max_addr_length=%d, actual_length=%p)", fd, addr_ptr, max_addr_length, actual_length);
+	int result = ENOSYS;
+	SYSTRACE("sys_sockname returning %d", result);
+	return result;
 }
 
 int sys_peername(int fd, struct sockaddr *addr_ptr, socklen_t max_addr_length,
 		socklen_t *actual_length) {
-	return ENOSYS;
+    SYSTRACE("sys_peername(fd=%d, addr_ptr=%p, max_addr_length=%d, actual_length=%p)", fd, addr_ptr, max_addr_length, actual_length);
+	int result = ENOSYS;
+	SYSTRACE("sys_peername returning %d", result);
+	return result;
 }
 
 int sys_listen(int fd, int backlog) {
-	return ENOSYS;
+    SYSTRACE("sys_listen(fd=%d, backlog=%d)", fd, backlog);
+	int result = ENOSYS;
+	SYSTRACE("sys_listen returning %d", result);
+	return result;
 }
 
 int sys_shutdown(int sockfd, int how) {
-	return ENOSYS;
+    SYSTRACE("sys_shutdown(sockfd=%d, how=%d)", sockfd, how);
+	int result = ENOSYS;
+	SYSTRACE("sys_shutdown returning %d", result);
+	return result;
 }
 
 int sys_getpriority(int which, id_t who, int *value) {
-	return ENOSYS;
+    SYSTRACE("sys_getpriority(which=%d, who=%d, value=%p)", which, who, value);
+	int result = ENOSYS;
+	SYSTRACE("sys_getpriority returning %d", result);
+	return result;
 }
 
 int sys_setpriority(int which, id_t who, int prio) {
-	return ENOSYS;
+    SYSTRACE("sys_setpriority(which=%d, who=%d, prio=%d)", which, who, prio);
+	int result = ENOSYS;
+	SYSTRACE("sys_setpriority returning %d", result);
+	return result;
 }
 
 int sys_open_dir(const char *path, int *fd) {
 	return sys_open(path, O_RDONLY | O_DIRECTORY, 0, fd);
 }
 
+#define ALIGN_UP(value, alignment) (((value) + (alignment) - 1) & ~((alignment) - 1))
 int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_read) {
+	SYSTRACE("sys_read_entries initial bytes_read: %ld", *bytes_read);
 	*bytes_read = 0;
+	off_t off = lseek(handle, 0, SEEK_CUR);
+	if(off == -1){
+		return errno;
+	}
+    size_t dirent_size = 32;
+	size_t nr_twz_entries = max_size / dirent_size;
+	if(nr_twz_entries <= 0)
+		nr_twz_entries = 1;
+	SYSTRACE("sys_read_entries(handle=%d, buffer=%p, max_size=%ld, bytes_read=%p), off=%ld, nr_twz_entries=%ld",
+		handle, buffer, max_size, bytes_read, off, nr_twz_entries);
+
+	struct name_entry twznames[nr_twz_entries];
+	struct io_result res = twz_rt_fd_enumerate_names(handle, twznames, nr_twz_entries, off / sizeof(struct name_entry));
+	if(res.err != 0)
+		return twz_error_errno(res.err);
+
+	SYSTRACE("twz_rt_fd_enumerate_names returned %ld entries", res.val);
+	if(res.val == 0)
+		return 0;
+
+	// it's null terminated
+	if(twznames[0].name_len + 1 + dirent_size > max_size)
+		return EINVAL;
+
+    size_t count = 0;
+	for(size_t i = 0;i < res.val;i++) {
+		struct name_entry *entry = &twznames[i];
+		if(entry->name_len + 1 + dirent_size + *bytes_read > max_size)
+			break;
+
+		size_t thislen = dirent_size + 1 + entry->name_len;
+		size_t this_reclen = ALIGN_UP(thislen, 8);
+		struct dirent *target = (struct dirent *)((char *)buffer + *bytes_read);
+		target->d_ino = objid_to_ino(entry->info.id);
+		target->d_reclen = this_reclen;
+		SYSTRACE("entry %ld: name=%.*s, ino=%ld, reclen=%hu, namelen=%d, direntsz = %ld, direntaln = %ld, thislen=%ld", i, entry->name_len, entry->name, target->d_ino, target->d_reclen, entry->name_len, dirent_size, thislen, 8);
+
+		char type = DT_UNKNOWN;
+		switch(entry->info.kind) {
+			case FdKind_Regular:
+				type = DT_REG;
+				break;
+			case FdKind_Directory:
+				type = DT_DIR;
+				break;
+			case FdKind_SymLink:
+				type = DT_LNK;
+				break;
+			default: break;
+		}
+
+		target->d_type = type;
+		target->d_off = this_reclen + *bytes_read;
+		memcpy(target->d_name, entry->name, entry->name_len);
+		target->d_name[entry->name_len] = 0;
+
+		*bytes_read += this_reclen;
+        count += 1;
+	}
+	SYSTRACE("total bytes read: %ld (%ld entries)", *bytes_read, count);
+
+	lseek(handle, count * sizeof(struct name_entry) + off, SEEK_SET);
 	return 0;
 }
 
 int sys_uname(struct utsname *buf) {
-	return ENOSYS;
+    SYSTRACE("sys_uname(buf=%p)", buf);
+	
+	if (!buf) {
+		int result = EFAULT;
+		SYSTRACE("sys_uname returning %d", result);
+		return result;
+	}
+
+	// Fill in the utsname structure with Twizzler information
+	snprintf(buf->sysname, sizeof(buf->sysname), "Twizzler");
+	snprintf(buf->nodename, sizeof(buf->nodename), "twizzler");
+	snprintf(buf->release, sizeof(buf->release), "1.0");
+	snprintf(buf->version, sizeof(buf->version), "twizzler-runtime");
+	snprintf(buf->machine, sizeof(buf->machine), "x86_64");
+
+	int result = 0;
+	SYSTRACE("sys_uname returning %d", result);
+	return result;
 }
 
 int sys_gethostname(char *buf, size_t bufsize) {
-	return ENOSYS;
+    SYSTRACE("sys_gethostname(buf=%p, bufsize=%ld)", buf, bufsize);
+	int result = ENOSYS;
+	SYSTRACE("sys_gethostname returning %d", result);
+	return result;
 }
 
 int sys_pread(int fd, void *buf, size_t n, off_t off, ssize_t *bytes_read) {
+    SYSTRACE("sys_pread(fd=%d, buf=%p, n=%ld, off=%ld, bytes_read=%p)", fd, buf, n, off, bytes_read);
    	struct io_ctx ctx = {
 		.flags = 0,
 		.offset = off,
@@ -791,18 +1037,22 @@ int sys_pwrite(int fd, const void *buf, size_t n, off_t off, ssize_t *bytes_writ
 }
 
 int sys_getsockopt(int fd, int layer, int number, void *__restrict buffer, socklen_t *__restrict size) {
-	return ENOSYS;
+    SYSTRACE("sys_getsockopt(fd=%d, layer=%d, number=%d, buffer=%p, size=%p)", fd, layer, number, buffer, size);
+	int result = ENOSYS;
+	SYSTRACE("sys_getsockopt returning %d", result);
+	return result;
 }
 
 int sys_sysconf(int num, long *ret) {
+    SYSTRACE("sys_sysconf(num=%d, ret=%p)", num, ret);
     struct system_info info = twz_rt_get_sysinfo();
 	switch(num) {
     	case _SC_NPROCESSORS_CONF:
-            return info.available_parallelism;
+            *ret = info.available_parallelism;
     	case _SC_NPROCESSORS_ONLN:
-    	    return info.available_parallelism;
+    	    *ret = info.available_parallelism;
         case _SC_PAGESIZE:
-            return info.page_size;
+            *ret = info.page_size;
 		default: {
 			return EINVAL;
 		}
@@ -811,38 +1061,61 @@ int sys_sysconf(int num, long *ret) {
 }
 //
 pid_t sys_getpid() {
-	return 1;
+    SYSTRACE("sys_getpid()");
+	pid_t result = 1;
+	SYSTRACE("sys_getpid returning %d", result);
+	return result;
 }
 
 pid_t sys_gettid() {
-	return 1;
+    SYSTRACE("sys_gettid()");
+	pid_t result = 1;
+	SYSTRACE("sys_gettid returning %d", result);
+	return result;
 }
 
 uid_t sys_getuid() {
-	return 0;
+    SYSTRACE("sys_getuid()");
+	uid_t result = 0;
+	SYSTRACE("sys_getuid returning %d", result);
+	return result;
 }
 
 uid_t sys_geteuid() {
-	return 0;
+    SYSTRACE("sys_geteuid()");
+	uid_t result = 0;
+	SYSTRACE("sys_geteuid returning %d", result);
+	return result;
 }
 
 gid_t sys_getgid() {
-	return 0;
+    SYSTRACE("sys_getgid()");
+	gid_t result = 0;
+	SYSTRACE("sys_getgid returning %d", result);
+	return result;
 }
 
 gid_t sys_getegid() {
-	return 0;
+    SYSTRACE("sys_getegid()");
+	gid_t result = 0;
+	SYSTRACE("sys_getegid returning %d", result);
+	return result;
 }
 
 int sys_kill(int pid, int sig) {
-	return ENOSYS;
+    SYSTRACE("sys_kill(pid=%d, sig=%d)", pid, sig);
+	int result = ENOSYS;
+	SYSTRACE("sys_kill returning %d", result);
+	return result;
 }
 
 void sys_thread_exit() {
+    SYSTRACE("sys_thread_exit()");
     twz_rt_exit(0);
 }
 
 void sys_exit(int status) {
+    SYSTRACE("sys_exit(status=%d)", status);
     twz_rt_exit(status);
 }
 
@@ -850,128 +1123,214 @@ void sys_exit(int status) {
 #define FUTEX_WAKE 1
 
 int sys_futex_tid() {
-	return 1;
+	int result = 1;
+	return result;
 }
 
 int sys_futex_wait(int *pointer, int expected, const struct timespec *time) {
-	return 0;
+	int result = 0;
+	return result;
 	//return ENOSYS;
 }
 
 int sys_futex_wake(int *pointer) {
-	return 0;
+	int result = 0;
+	return result;
 	//return ENOSYS;
 }
 
 int sys_mkdir(const char *path, mode_t mode) {
     SYSTRACE("sys_mkdir(path=%s, mode=%o)", path, mode);
     sys_libc_log("call to mkdir");
-	return ENOSYS;
+	int result = ENOSYS;
+	SYSTRACE("sys_mkdir returning %d", result);
+	return result;
 }
 
 
 int sys_mkdirat(int dirfd, const char *path, mode_t mode) {
     SYSTRACE("sys_mkdirat(dirfd=%d, path=%s, mode=%o)", dirfd, path, mode);
     sys_libc_log("call to mkdirat");
-	return ENOSYS;
+	int result = ENOSYS;
+	SYSTRACE("sys_mkdirat returning %d", result);
+	return result;
 }
 
 int sys_mknodat(int dirfd, const char *path, int mode, int dev) {
-	return ENOSYS;
+    SYSTRACE("sys_mknodat(dirfd=%d, path=%s, mode=%d, dev=%d)", dirfd, path, mode, dev);
+	int result = ENOSYS;
+	SYSTRACE("sys_mknodat returning %d", result);
+	return result;
 }
 
 int sys_mkfifoat(int dirfd, const char *path, mode_t mode) {
-	return ENOSYS;
+    SYSTRACE("sys_mkfifoat(dirfd=%d, path=%s, mode=%o)", dirfd, path, mode);
+	int result = ENOSYS;
+	SYSTRACE("sys_mkfifoat returning %d", result);
+	return result;
 }
 
 int sys_symlink(const char *target_path, const char *link_path) {
-	return ENOSYS;
+    SYSTRACE("sys_symlink(target_path=%s, link_path=%s)", target_path, link_path);
+	int result = ENOSYS;
+	SYSTRACE("sys_symlink returning %d", result);
+	return result;
 }
 
 int sys_symlinkat(const char *target_path, int dirfd, const char *link_path) {
-	return ENOSYS;
+    SYSTRACE("sys_symlinkat(target_path=%s, dirfd=%d, link_path=%s)", target_path, dirfd, link_path);
+	int result = ENOSYS;
+	SYSTRACE("sys_symlinkat returning %d", result);
+	return result;
 }
 
 int sys_umask(mode_t mode, mode_t *old) {
-	return ENOSYS;
+    SYSTRACE("sys_umask(mode=%o, old=%p)", mode, old);
+	int result = ENOSYS;
+	SYSTRACE("sys_umask returning %d", result);
+	return result;
 }
 
 int sys_chdir(const char *path) {
     SYSTRACE("sys_chdir(path=%s)", path);
-	return ENOSYS;
+	int result = ENOSYS;
+	SYSTRACE("sys_chdir returning %d", result);
+	return result;
 }
 
 int sys_fchdir(int fd) {
     SYSTRACE("sys_fchdir(fd=%d)", fd);
-	return ENOSYS;
+	int result = ENOSYS;
+	SYSTRACE("sys_fchdir returning %d", result);
+	return result;
 }
 
 int sys_rename(const char *old_path, const char *new_path) {
-	return ENOSYS;
+    SYSTRACE("sys_rename(old_path=%s, new_path=%s)", old_path, new_path);
+	int result = ENOSYS;
+	SYSTRACE("sys_rename returning %d", result);
+	return result;
 }
 
 int sys_renameat(int old_dirfd, const char *old_path, int new_dirfd, const char *new_path) {
-	return ENOSYS;
+    SYSTRACE("sys_renameat(old_dirfd=%d, old_path=%s, new_dirfd=%d, new_path=%s)", old_dirfd, old_path, new_dirfd, new_path);
+	int result = ENOSYS;
+	SYSTRACE("sys_renameat returning %d", result);
+	return result;
 }
 
 int sys_rmdir(const char *path) {
-	return ENOSYS;
+    SYSTRACE("sys_rmdir(path=%s)", path);
+	int result = ENOSYS;
+	SYSTRACE("sys_rmdir returning %d", result);
+	return result;
 }
 
 int sys_ftruncate(int fd, size_t size) {
-	return ENOSYS;
+    SYSTRACE("sys_ftruncate(fd=%d, size=%ld)", fd, size);
+	int result = ENOSYS;
+	SYSTRACE("sys_ftruncate returning %d", result);
+	return result;
 }
 
 int sys_readlink(const char *path, void *buf, size_t bufsiz, ssize_t *len) {
-	return ENOSYS;
+    SYSTRACE("sys_readlink(path=%s, buf=%p, bufsiz=%ld, len=%p)", path, buf, bufsiz, len);
+    if(len) *len = 0;
+    uint64_t out_len;
+    twz_error err = twz_rt_fd_readlink(path, strlen(path), (char *)buf, bufsiz, &out_len);
+    int result;
+    if (err != 0) {
+        result = twz_error_errno(err);
+    } else if (out_len > SSIZE_MAX) {
+        result = EOVERFLOW;
+    } else {
+        if(len) *len = (ssize_t)out_len;
+        result = 0;
+    }
+    SYSTRACE("sys_readlink returning %d", result);
+    return result;
 }
 
 pid_t sys_getppid() {
-	return 1;
+    SYSTRACE("sys_getppid()");
+	pid_t result = 1;
+	SYSTRACE("sys_getppid returning %d", result);
+	return result;
 }
 
 int sys_setpgid(pid_t pid, pid_t pgid) {
-	return 0;
+    SYSTRACE("sys_setpgid(pid=%d, pgid=%d)", pid, pgid);
+	int result = 0;
+	SYSTRACE("sys_setpgid returning %d", result);
+	return result;
 }
 
 int sys_getsid(pid_t pid, pid_t *sid) {
-	return 1;
+    SYSTRACE("sys_getsid(pid=%d, sid=%p)", pid, sid);
+	int result = 1;
+	SYSTRACE("sys_getsid returning %d", result);
+	return result;
 }
 
 int sys_setsid(pid_t *sid) {
-	return 0;
+    SYSTRACE("sys_setsid(sid=%p)", sid);
+	int result = 0;
+	SYSTRACE("sys_setsid returning %d", result);
+	return result;
 }
 
 int sys_setuid(uid_t uid) {
-	return 0;
+    SYSTRACE("sys_setuid(uid=%d)", uid);
+	int result = 0;
+	SYSTRACE("sys_setuid returning %d", result);
+	return result;
 }
 
 int sys_setgid(gid_t gid) {
-	return 0;
+    SYSTRACE("sys_setgid(gid=%d)", gid);
+	int result = 0;
+	SYSTRACE("sys_setgid returning %d", result);
+	return result;
 }
 
 int sys_getpgid(pid_t pid, pid_t *out) {
-	return 1;
+    SYSTRACE("sys_getpgid(pid=%d, out=%p)", pid, out);
+	int result = 1;
+	SYSTRACE("sys_getpgid returning %d", result);
+	return result;
 }
 
 int sys_getgroups(size_t size, gid_t *list, int *retval) {
-	return ENOSYS;
+    SYSTRACE("sys_getgroups(size=%ld, list=%p, retval=%p)", size, list, retval);
+	int result = ENOSYS;
+	SYSTRACE("sys_getgroups returning %d", result);
+	return result;
 }
 
 int sys_dup(int fd, int flags, int *newfd) {
-	return ENOSYS;
+    SYSTRACE("sys_dup(fd=%d, flags=%d, newfd=%p)", fd, flags, newfd);
+	int result = ENOSYS;
+	SYSTRACE("sys_dup returning %d", result);
+	return result;
 }
 
 void sys_sync() {
+    SYSTRACE("sys_sync()");
 	// TODO
 }
 
 int sys_fsync(int fd) {
-	return 0;
+    SYSTRACE("sys_fsync(fd=%d)", fd);
+	int result = 0;
+	SYSTRACE("sys_fsync returning %d", result);
+	return result;
 }
 
 int sys_fdatasync(int fd) {
-	return 0;
+    SYSTRACE("sys_fdatasync(fd=%d)", fd);
+	int result = 0;
+	SYSTRACE("sys_fdatasync returning %d", result);
+	return result;
 }
 
 int sys_getrandom(void *buffer, size_t length, int flags, ssize_t *bytes_written) {
