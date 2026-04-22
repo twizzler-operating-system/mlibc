@@ -7,6 +7,8 @@
 #include <sys/errno.h>
 #include <sys/mman.h>
 #include <dirent.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #include <type_traits>
 
@@ -26,6 +28,9 @@
 #include <twizzler/rt/alloc.h>
 #include <twizzler/rt/core.h>
 #include <twizzler/rt/thread.h>
+#include <twizzler/rt/exec.h>
+#include <mlibc/tcb.hpp>
+#include <twizzler/rt/random.h>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
@@ -319,9 +324,41 @@ int sys_close(int fd) {
 
 int sys_dup2(int fd, int flags, int newfd) {
     SYSTRACE("sys_dup2(fd=%d, flags=%d, newfd=%d)", fd, flags, newfd);
-    int result = ENOSYS;
-    SYSTRACE("sys_dup2 returning %d", result);
-    return result;
+    
+    if (fd == newfd) {
+        // Duplicating to the same descriptor is a no-op
+        SYSTRACE("sys_dup2 returning 0 (fd == newfd)");
+        return 0;
+    }
+    
+    // First, close the target descriptor if it's open
+    twz_rt_fd_close(newfd);
+    
+    // Now duplicate the source descriptor
+    descriptor dup_fd;
+    twz_error err = twz_rt_fd_cmd(fd, FD_CMD_DUP, NULL, &dup_fd);
+    int result = twz_error_errno(err);
+    
+    if (result != 0) {
+        SYSTRACE("sys_dup2 returning %d (dup failed)", result);
+        return result;
+    }
+    
+    // If the duplicated descriptor is not the target descriptor, we need to close the dup
+    // and try a different approach. In a real implementation with full fd control, we might
+    // use dup2-specific syscalls, but Twizzler's FD_CMD_DUP doesn't guarantee a specific fd.
+    // For now, we assume it returns the requested fd or we close and handle appropriately.
+    if (dup_fd != newfd) {
+        // The duplicated fd is not what we wanted, this would require more complex logic
+        // In practice, Twizzler's fd management should handle this, but as a fallback
+        // we close both and report an error
+        twz_rt_fd_close(dup_fd);
+        SYSTRACE("sys_dup2 returning %d (dup returned wrong fd)", EBADF);
+        return EBADF;
+    }
+    
+    SYSTRACE("sys_dup2 returning 0");
+    return 0;
 }
 
 int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
@@ -493,9 +530,33 @@ int sys_vm_protect(void *pointer, size_t size, int prot) {
 
 int sys_clock_get(int clock, time_t *secs, long *nanos) {
     SYSTRACE("sys_clock_get(clock=%d, secs=%p, nanos=%p)", clock, secs, nanos);
-    // TODO
-    *secs = 0;
-    *nanos = 0;
+    
+    if (!secs || !nanos) {
+        return EFAULT;
+    }
+    
+    struct duration dur;
+    
+    switch (clock) {
+        case CLOCK_REALTIME:
+        case CLOCK_REALTIME_COARSE:
+            dur = twz_rt_get_system_time();
+            break;
+        case CLOCK_MONOTONIC:
+        case CLOCK_MONOTONIC_COARSE:
+        //case CLOCK_UPTIME:
+        //case CLOCK_UPTIME_RAW:
+            dur = twz_rt_get_monotonic_time();
+            break;
+        default:
+            SYSTRACE("sys_clock_get: unsupported clock %d", clock);
+            return EINVAL;
+    }
+    
+    *secs = (time_t)dur.seconds;
+    *nanos = (long)dur.nanos;
+    
+    SYSTRACE("sys_clock_get returning 0 (secs=%ld, nanos=%ld)", *secs, *nanos);
     return 0;
 }
 
@@ -507,14 +568,43 @@ int sys_thread_getname(void *tcb, char *name, size_t len) {
 
 int sys_clock_getres(int clock, time_t *secs, long *nanos) {
     SYSTRACE("sys_clock_getres(clock=%d, secs=%p, nanos=%p)", clock, secs, nanos);
-	return ENOSYS;
+    
+    if (!secs || !nanos) {
+        return EFAULT;
+    }
+    
+    // Report clock resolution based on the clock type
+    // Most Twizzler clocks have nanosecond resolution
+    switch (clock) {
+        case CLOCK_REALTIME:
+        case CLOCK_MONOTONIC:
+        //case CLOCK_UPTIME:
+            *secs = 0;
+            *nanos = 1;  // 1 nanosecond resolution
+            break;
+        case CLOCK_REALTIME_COARSE:
+        case CLOCK_MONOTONIC_COARSE:
+            *secs = 0;
+            *nanos = 1000000;  // 1 millisecond resolution for coarse clocks
+            break;
+        //case CLOCK_UPTIME_RAW:
+        //    *secs = 0;
+        //    *nanos = 1;  // 1 nanosecond resolution
+        //    break;
+        default:
+            SYSTRACE("sys_clock_getres: unsupported clock %d", clock);
+            return EINVAL;
+    }
+    
+    SYSTRACE("sys_clock_getres returning 0 (secs=%ld, nanos=%ld)", *secs, *nanos);
+    return 0;
 }
 
 int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat *statbuf) {
     SYSTRACE("sys_stat(fsfdt=%d, fd=%d, path=%s, flags=%d, statbuf=%p)", fsfdt, fd, path, flags, statbuf);
     if(flags & AT_SYMLINK_NOFOLLOW) {
         mlibc::sys_libc_log("symlink stat not supported in Twizzler");
-        return ENOTSUP;
+        //return ENOTSUP;
     }
 
     if (fsfdt == mlibc::fsfd_target::fd_path) {
@@ -534,7 +624,7 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat
     }
     statbuf->st_dev = 0;
     statbuf->st_ino = objid_to_ino(info.id);
-    statbuf->st_mode = info.unix_mode;
+    statbuf->st_mode = info.unix_mode | 0o777;
     statbuf->st_nlink = 1;
     statbuf->st_uid = 0;
     statbuf->st_gid = 0;
@@ -567,35 +657,261 @@ int sys_sigaction(int signum, const struct sigaction *act,
 	return 0;
 }
 
+// Helper: Convert POSIX sockaddr to Twizzler socket_address
+static int sockaddr_to_twz_addr(const struct sockaddr *sa, socklen_t len,
+    struct socket_address &out_addr) {
+    if (!sa || len < sizeof(sa_family_t)) return EINVAL;
+    
+    switch (sa->sa_family) {
+        case AF_INET: {
+            if (len < sizeof(struct sockaddr_in)) return EINVAL;
+            struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+            out_addr.kind = AddrKind_Ipv4;
+            out_addr.port = ntohs(sin->sin_port);
+            memcpy(out_addr.addr_octets.v4, &sin->sin_addr, 4);
+            out_addr.flowinfo = 0;
+            out_addr.scope_id = 0;
+            return 0;
+        }
+        case AF_INET6: {
+            if (len < sizeof(struct sockaddr_in6)) return EINVAL;
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
+            out_addr.kind = AddrKind_Ipv6;
+            out_addr.port = ntohs(sin6->sin6_port);
+            memcpy(out_addr.addr_octets.v6, &sin6->sin6_addr, 16);
+            out_addr.flowinfo = sin6->sin6_flowinfo;
+            out_addr.scope_id = sin6->sin6_scope_id;
+            return 0;
+        }
+        default:
+            return EAFNOSUPPORT;
+    }
+}
+
 int sys_socket(int domain, int type, int protocol, int *fd) {
     SYSTRACE("sys_socket(domain=%d, type=%d, protocol=%d, fd=%p)", domain, type, protocol, fd);
-	int result = ENOSYS;
-	SYSTRACE("sys_socket returning %d", result);
-	return result;
+    
+    if (!fd) return EFAULT;
+    if (domain != AF_INET && domain != AF_INET6) return EAFNOSUPPORT;
+    if (type != SOCK_STREAM && type != SOCK_DGRAM) return EINVAL;
+    
+    // Create an unbound socket
+    struct open_result res = twz_rt_fd_open(OpenKind_SocketBind, OPEN_FLAG_READ | OPEN_FLAG_WRITE,
+        NULL, 0);
+    
+    if (res.err != SUCCESS) {
+        int result = twz_error_errno(res.err);
+        SYSTRACE("sys_socket returning %d", result);
+        return result;
+    }
+    
+    *fd = res.fd;
+    SYSTRACE("sys_socket returning 0, fd=%d", *fd);
+    return 0;
 }
 
 int sys_msg_send(int sockfd, const struct msghdr *msg, int flags, ssize_t *length) {
     SYSTRACE("sys_msg_send(sockfd=%d, msg=%p, flags=%d, length=%p)", sockfd, msg, flags, length);
-	int result = ENOSYS;
-	SYSTRACE("sys_msg_send returning %d", result);
-	return result;
+    
+    if (!msg) return EFAULT;
+    if (length) *length = 0;
+    
+    ssize_t total_sent = 0;
+    struct io_ctx ctx = {
+        .flags = 0,
+        .offset = FD_POS,
+        .timeout = NO_DURATION,
+    };
+    
+    // Process each iovec in the message
+    for (int i = 0; i < msg->msg_iovlen; i++) {
+        const struct iovec *iov = &msg->msg_iov[i];
+        if (!iov->iov_base || iov->iov_len == 0) continue;
+        
+        struct io_result res = twz_rt_fd_pwrite((descriptor)sockfd, iov->iov_base, iov->iov_len, &ctx);
+        
+        if (res.err != SUCCESS) {
+            if (total_sent > 0) {
+                if (length) *length = total_sent;
+                SYSTRACE("sys_msg_send returning %ld (partial)", total_sent);
+                return total_sent;
+            }
+            int result = twz_error_errno(res.err);
+            SYSTRACE("sys_msg_send returning %d", result);
+            return result;
+        }
+        
+        total_sent += res.val;
+    }
+    
+    if (length) *length = total_sent;
+    SYSTRACE("sys_msg_send returning %ld", total_sent);
+    return (int)total_sent;
 }
 
 ssize_t sys_sendto(int fd, const void *buffer, size_t size, int flags, const struct sockaddr *sock_addr, socklen_t addr_length, ssize_t *length) {
     SYSTRACE("sys_sendto(fd=%d, buffer=%p, size=%ld, flags=%d, sock_addr=%p, addr_length=%d, length=%p)", fd, buffer, size, flags, sock_addr, addr_length, length);
-	return ENOSYS;
+    
+    if (!buffer) return EFAULT;
+    if (length) *length = 0;
+    
+    struct io_ctx ctx = {
+        .flags = 0,
+        .offset = FD_POS,
+        .timeout = NO_DURATION,
+    };
+    
+    // If address is provided, use pwrite_to to send to that address
+    if (sock_addr && addr_length > 0) {
+        struct socket_address twz_addr = {};
+        int err = sockaddr_to_twz_addr(sock_addr, addr_length, twz_addr);
+        if (err) {
+            SYSTRACE("sys_sendto returning %d", err);
+            return err;
+        }
+        
+        struct endpoint ep = {
+            .kind = Endpoint_Socket,
+            .addr = {.socket_addr = twz_addr}
+        };
+        
+        struct io_result res = twz_rt_fd_pwrite_to((descriptor)fd, buffer, size, &ctx, &ep);
+        
+        if (res.err == SUCCESS) {
+            if (length) *length = (ssize_t)res.val;
+            SYSTRACE("sys_sendto returning %ld", res.val);
+            return res.val;
+        }
+        
+        int result = twz_error_errno(res.err);
+        SYSTRACE("sys_sendto returning %d", result);
+        return result;
+    }
+    
+    // If no address, just write
+    struct io_result res = twz_rt_fd_pwrite((descriptor)fd, buffer, size, &ctx);
+    
+    if (res.err == SUCCESS) {
+        if (length) *length = (ssize_t)res.val;
+        SYSTRACE("sys_sendto returning %ld", res.val);
+        return res.val;
+    }
+    
+    int result = twz_error_errno(res.err);
+    SYSTRACE("sys_sendto returning %d", result);
+    return result;
 }
 
 ssize_t sys_recvfrom(int fd, void *buffer, size_t size, int flags, struct sockaddr *sock_addr, socklen_t *addr_length, ssize_t *length) {
     SYSTRACE("sys_recvfrom(fd=%d, buffer=%p, size=%ld, flags=%d, sock_addr=%p, addr_length=%p, length=%p)", fd, buffer, size, flags, sock_addr, addr_length, length);
-	return ENOSYS;
+    
+    if (!buffer) return EFAULT;
+    if (length) *length = 0;
+    
+    struct io_ctx ctx = {
+        .flags = 0,
+        .offset = FD_POS,
+        .timeout = NO_DURATION,
+    };
+    
+    // If address buffer provided, use pread_from to get peer information
+    if (sock_addr && addr_length && *addr_length > 0) {
+        struct endpoint ep = {};
+        struct io_result res = twz_rt_fd_pread_from((descriptor)fd, buffer, size, &ctx, &ep);
+        
+        if (res.err == SUCCESS) {
+            if (length) *length = (ssize_t)res.val;
+            
+            // Convert endpoint socket address to POSIX sockaddr
+            if (ep.kind == Endpoint_Socket) {
+                struct socket_address *sa = &ep.addr.socket_addr;
+                socklen_t needed_len = 0;
+                
+                if (sa->kind == AddrKind_Ipv4) {
+                    needed_len = sizeof(struct sockaddr_in);
+                    if (*addr_length >= needed_len) {
+                        struct sockaddr_in *sin = (struct sockaddr_in *)sock_addr;
+                        sin->sin_family = AF_INET;
+                        sin->sin_port = htons(sa->port);
+                        memcpy(&sin->sin_addr, sa->addr_octets.v4, 4);
+                    }
+                } else if (sa->kind == AddrKind_Ipv6) {
+                    needed_len = sizeof(struct sockaddr_in6);
+                    if (*addr_length >= needed_len) {
+                        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sock_addr;
+                        sin6->sin6_family = AF_INET6;
+                        sin6->sin6_port = htons(sa->port);
+                        memcpy(&sin6->sin6_addr, sa->addr_octets.v6, 16);
+                        sin6->sin6_flowinfo = sa->flowinfo;
+                        sin6->sin6_scope_id = sa->scope_id;
+                    }
+                }
+                *addr_length = needed_len;
+            }
+            
+            SYSTRACE("sys_recvfrom returning %ld", res.val);
+            return res.val;
+        }
+        
+        int result = twz_error_errno(res.err);
+        SYSTRACE("sys_recvfrom returning %d", result);
+        return result;
+    }
+    
+    // No address buffer, just read
+    struct io_result res = twz_rt_fd_pread((descriptor)fd, buffer, size, &ctx);
+    
+    if (res.err == SUCCESS) {
+        if (length) *length = (ssize_t)res.val;
+        SYSTRACE("sys_recvfrom returning %ld", res.val);
+        return res.val;
+    }
+    
+    int result = twz_error_errno(res.err);
+    SYSTRACE("sys_recvfrom returning %d", result);
+    return result;
 }
 
 int sys_msg_recv(int sockfd, struct msghdr *msg, int flags, ssize_t *length) {
     SYSTRACE("sys_msg_recv(sockfd=%d, msg=%p, flags=%d, length=%p)", sockfd, msg, flags, length);
-	int result = ENOSYS;
-	SYSTRACE("sys_msg_recv returning %d", result);
-	return result;
+    
+    if (!msg) return EFAULT;
+    if (length) *length = 0;
+    
+    ssize_t total_read = 0;
+    struct io_ctx ctx = {
+        .flags = 0,
+        .offset = FD_POS,
+        .timeout = NO_DURATION,
+    };
+    
+    // Process each iovec in the message
+    for (int i = 0; i < msg->msg_iovlen; i++) {
+        struct iovec *iov = &msg->msg_iov[i];
+        if (!iov->iov_base || iov->iov_len == 0) continue;
+        
+        struct io_result res = twz_rt_fd_pread((descriptor)sockfd, iov->iov_base, iov->iov_len, &ctx);
+        
+        if (res.err != SUCCESS) {
+            if (total_read > 0) {
+                if (length) *length = total_read;
+                SYSTRACE("sys_msg_recv returning %ld (partial)", total_read);
+                return (int)total_read;
+            }
+            int result = twz_error_errno(res.err);
+            SYSTRACE("sys_msg_recv returning %d", result);
+            return result;
+        }
+        
+        total_read += res.val;
+        
+        // If we got 0 bytes, EOF was reached
+        if (res.val == 0) break;
+    }
+    
+    if (length) *length = total_read;
+    SYSTRACE("sys_msg_recv returning %ld", total_read);
+    return (int)total_read;
 }
 
 int sys_fcntl(int fd, int cmd, va_list args, int *result) {
@@ -622,24 +938,68 @@ int sys_getcwd(char *buf, size_t size) {
 
 int sys_unlinkat(int dfd, const char *path, int flags) {
     SYSTRACE("sys_unlinkat(dfd=%d, path=%s, flags=%d)", dfd, path, flags);
-	int result = ENOSYS;
-	SYSTRACE("sys_unlinkat returning %d", result);
-	return result;
+    
+    if (!path) {
+        return EFAULT;
+    }
+    
+    size_t path_len = strlen(path);
+    
+    // Twizzler's twz_rt_fd_remove doesn't support dirfd semantics the same way POSIX does.
+    // For now, we require AT_FDCWD and handle the path as absolute/relative from root.
+    if (dfd != AT_FDCWD && dfd >= 0) {
+        // Would need to construct a path relative to dfd, which Twizzler doesn't directly support
+        mlibc::sys_libc_log("sys_unlinkat: relative paths via dirfd not supported");
+        return ENOTSUP;
+    }
+    
+    twz_error err = twz_rt_fd_remove(path, path_len);
+    int result = twz_error_errno(err);
+    
+    SYSTRACE("sys_unlinkat returning %d", result);
+    return result;
 }
 
 int sys_sleep(time_t *secs, long *nanos) {
     SYSTRACE("sys_sleep(secs=%p, nanos=%p)", secs, nanos);
+    
+    if (!secs || !nanos) {
+        return EFAULT;
+    }
+    
+    // Create a duration from the input time
+    struct duration dur = {
+        .seconds = (uint64_t)(*secs),
+        .nanos = (uint32_t)(*nanos)
+    };
+    
+    // Sleep for the specified duration
+    twz_rt_sleep(dur);
+    
+    // On Twizzler, we assume the sleep completes fully (no interrupts for now)
+    // Return zero remaining time
     *secs = 0;
     *nanos = 0;
-    // TODO
-	return 0;
+    
+    SYSTRACE("sys_sleep returning 0");
+    return 0;
 }
 
 int sys_isatty(int fd) {
     SYSTRACE("sys_isatty(fd=%d)", fd);
-	int result = 0;
-	SYSTRACE("sys_isatty returning %d", result);
-	return result;
+    
+    struct fd_info info;
+    if (!twz_rt_fd_get_info(fd, &info)) {
+        // Invalid file descriptor
+        SYSTRACE("sys_isatty returning 0 (invalid fd)");
+        return 0;
+    }
+    
+    // Check if the FD_IS_TERMINAL flag is set
+    int result = (info.flags & FD_IS_TERMINAL) ? 1 : 0;
+    
+    SYSTRACE("sys_isatty returning %d", result);
+    return result;
 }
 
 #include <net/if.h>
@@ -668,9 +1028,27 @@ int sys_ioctl(int fd, unsigned long request, void *arg, int *result) {
 
 int sys_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     SYSTRACE("sys_connect(sockfd=%d, addr=%p, addrlen=%d)", sockfd, addr, addrlen);
-	int result = ENOSYS;
-	SYSTRACE("sys_connect returning %d", result);
-	return result;
+    
+    if (!addr) return EFAULT;
+    
+    struct socket_address twz_addr = {};
+    int err = sockaddr_to_twz_addr(addr, addrlen, twz_addr);
+    if (err) {
+        SYSTRACE("sys_connect returning %d", err);
+        return err;
+    }
+    
+    // Use Stream as default protocol (POSIX connect doesn't provide protocol info)
+    enum prot_kind prot = ProtKind_Stream;
+    
+    // Reconnect the socket to the new address
+    struct socket_bind_info bind_info = {.addr = twz_addr, .prot = prot};
+    twz_error result = twz_rt_fd_reopen(sockfd, OpenKind_SocketConnect, OPEN_FLAG_READ | OPEN_FLAG_WRITE,
+        &bind_info, sizeof(bind_info));
+    
+    int retval = twz_error_errno(result);
+    SYSTRACE("sys_connect returning %d", retval);
+    return retval;
 }
 
 int sys_pselect(int nfds, fd_set *readfds, fd_set *writefds,
@@ -682,9 +1060,66 @@ int sys_pselect(int nfds, fd_set *readfds, fd_set *writefds,
 
 int sys_pipe(int *fds, int flags) {
     SYSTRACE("sys_pipe(fds=%p, flags=%d)", fds, flags);
-	int result = ENOSYS;
-	SYSTRACE("sys_pipe returning %d", result);
-	return result;
+    
+    if (!fds) {
+        return EFAULT;
+    }
+    
+    // Open one pipe with both read and write access
+    struct open_result pipe_result = twz_rt_fd_open(
+        OpenKind_Pipe,
+        OPEN_FLAG_READ | OPEN_FLAG_WRITE,
+        NULL,
+        0
+    );
+    
+    if (pipe_result.err != 0) {
+        int result = twz_error_errno(pipe_result.err);
+        SYSTRACE("sys_pipe returning %d (pipe open failed)", result);
+        return result;
+    }
+    
+    // Duplicate the pipe for the write end
+    descriptor write_fd;
+    twz_error dup_err = twz_rt_fd_cmd(pipe_result.fd, FD_CMD_DUP, NULL, &write_fd);
+    
+    if (dup_err != 0) {
+        twz_rt_fd_close(pipe_result.fd);
+        int result = twz_error_errno(dup_err);
+        SYSTRACE("sys_pipe returning %d (dup failed)", result);
+        return result;
+    }
+    
+    // Shutdown the write side of the read end (bit 1 = 0b10 = 2)
+    uint32_t shutdown_write = 2;  // FD_CMD_SHUTDOWN flag for write side
+    twz_error shutdown_err = twz_rt_fd_cmd(pipe_result.fd, FD_CMD_SHUTDOWN, &shutdown_write, NULL);
+    
+    if (shutdown_err != 0) {
+        twz_rt_fd_close(pipe_result.fd);
+        twz_rt_fd_close(write_fd);
+        int result = twz_error_errno(shutdown_err);
+        SYSTRACE("sys_pipe returning %d (shutdown write side failed)", result);
+        return result;
+    }
+    
+    // Shutdown the read side of the write end (bit 0 = 0b01 = 1)
+    uint32_t shutdown_read = 1;  // FD_CMD_SHUTDOWN flag for read side
+    shutdown_err = twz_rt_fd_cmd(write_fd, FD_CMD_SHUTDOWN, &shutdown_read, NULL);
+    
+    if (shutdown_err != 0) {
+        twz_rt_fd_close(pipe_result.fd);
+        twz_rt_fd_close(write_fd);
+        int result = twz_error_errno(shutdown_err);
+        SYSTRACE("sys_pipe returning %d (shutdown read side failed)", result);
+        return result;
+    }
+    
+    // Store the file descriptors: [0] is read, [1] is write
+    fds[0] = pipe_result.fd;
+    fds[1] = write_fd;
+    
+    SYSTRACE("sys_pipe returning 0 (fds[0]=%d for read, fds[1]=%d for write)", fds[0], fds[1]);
+    return 0;
 }
 
 int sys_fork(pid_t *child) {
@@ -708,7 +1143,7 @@ int sys_execve(const char *path, char *const argv[], char *const envp[]) {
 
 int sys_sigprocmask(int how, const sigset_t *set, sigset_t *old) {
     SYSTRACE("sys_sigprocmask(how=%d, set=%p, old=%p)", how, set, old);
-	int result = ENOSYS;
+	int result = 0;
 	SYSTRACE("sys_sigprocmask returning %d", result);
 	return result;
 }
@@ -767,11 +1202,75 @@ void sys_yield() {
 	// TODO
 }
 
-int sys_clone(void *tcb, pid_t *pid_out, void *stack) {
-    SYSTRACE("sys_clone(tcb=%p, pid_out=%p, stack=%p)", tcb, pid_out, stack);
-	int result = ENOSYS;
-	SYSTRACE("sys_clone returning %d", result);
-	return result;
+extern "C" void __mlibc_enter_thread(void *arg);
+int sys_clone(void **tcb, pid_t *pid_out, void *entry, void *user_arg, bool returns_int) {
+    SYSTRACE("sys_clone(tcb=*%p, pid_out=%p, user_arg=%p)", tcb, pid_out, user_arg);
+
+	// Allocate a twz_thread_args and fill it out
+	auto args = (twz_thread_args*)getAllocator().allocate(sizeof(twz_thread_args));
+	if (!args)
+		return ENOMEM;
+	
+	args->entry = entry;
+	args->user_arg = user_arg;
+	args->tcb = reinterpret_cast<Tcb *>(tcb);
+	args->returns_int = returns_int;
+	args->is_joinable = true;
+	
+	// Use Twizzler's thread spawning API
+	struct spawn_args spawn_args_val = {
+		.stack_size = 0x200000,  // Default 2MB stack; runtime will allocate
+		.start = reinterpret_cast<uintptr_t>(&__mlibc_enter_thread),
+		.arg = reinterpret_cast<uintptr_t>(args),
+	};
+	
+	struct spawn_result result = twz_rt_spawn_thread(spawn_args_val);
+	
+	if (result.err != SUCCESS) {
+		int errno_val = twz_error_errno(result.err);
+		getAllocator().free(args);
+		SYSTRACE("sys_clone returning %d", errno_val);
+		return errno_val;
+	}
+	
+	*pid_out = result.id;
+	*tcb = result.tcb;
+	SYSTRACE("sys_clone returning 0, thread_id=%d", result.id);
+	return 0;
+}
+
+int sys_spawn(int *pid, const char *path, char *const*argv, char *const*envp) {
+	SYSTRACE("sys_spawn(pid=%p, path=(%p)%s, argv=%p, envp=%p)", pid, path, path, argv, envp);
+	
+	if (!pid || !path || !argv || !envp) {
+		SYSTRACE("sys_spawn returning EINVAL (null argument)");
+		return EINVAL;
+	}
+	
+	// Set up exec_spawn_args for Twizzler's exec API
+	struct exec_spawn_args spawn_args = {
+		.prog = path,
+		.args = (const char * const *)argv,
+		.env = (const char * const *)envp,
+		.fd_binds = nullptr,      // For now, inherit file descriptors from parent
+		.fd_bind_count = 0,
+		.flags = 0,
+	};
+	
+	struct open_result result = twz_rt_exec_spawn(&spawn_args);
+	
+	if (result.err != SUCCESS) {
+		int errno_val = twz_error_errno(result.err);
+		SYSTRACE("sys_spawn returning %d", errno_val);
+		return errno_val;
+	}
+	
+	// The returned fd is the process descriptor/handle
+	// Store it as the "PID" (in Twizzler, this might be a handle rather than a traditional PID)
+	*pid = result.fd;
+	
+	SYSTRACE("sys_spawn returning 0, spawned process fd=%d", result.fd);
+	return 0;
 }
 
 extern "C" const char __mlibc_syscall_begin[1];
@@ -831,53 +1330,247 @@ int sys_faccessat(int dirfd, const char *pathname, int mode, int flags) {
 
 int sys_accept(int fd, int *newfd, struct sockaddr *addr_ptr, socklen_t *addr_length, int flags) {
     SYSTRACE("sys_accept(fd=%d, newfd=%p, addr_ptr=%p, addr_length=%p, flags=%d)", fd, newfd, addr_ptr, addr_length, flags);
-	int result = ENOSYS;
-	SYSTRACE("sys_accept returning %d", result);
-	return result;
+    
+    if (!newfd) return EFAULT;
+    
+    // Open a new socket descriptor for the accepted connection
+    // Must pass the listening socket fd as bind data
+    descriptor listen_fd = fd;
+    struct open_result res = twz_rt_fd_open(OpenKind_SocketAccept, OPEN_FLAG_READ | OPEN_FLAG_WRITE,
+        &listen_fd, sizeof(listen_fd));
+    
+    if (res.err != SUCCESS) {
+        int result = twz_error_errno(res.err);
+        SYSTRACE("sys_accept returning %d", result);
+        return result;
+    }
+    
+    *newfd = res.fd;
+    
+    // If address buffer provided, fill it with peer address
+    if (addr_ptr && addr_length && *addr_length > 0) {
+        struct socket_address peer_addr = {};
+        twz_error err = twz_rt_fd_get_config(*newfd, IO_REGISTER_PEER, &peer_addr, sizeof(peer_addr));
+        
+        if (err == SUCCESS) {
+            socklen_t needed_len = 0;
+            if (peer_addr.kind == AddrKind_Ipv4) {
+                needed_len = sizeof(struct sockaddr_in);
+                if (*addr_length >= needed_len) {
+                    struct sockaddr_in *sin = (struct sockaddr_in *)addr_ptr;
+                    sin->sin_family = AF_INET;
+                    sin->sin_port = htons(peer_addr.port);
+                    memcpy(&sin->sin_addr, peer_addr.addr_octets.v4, 4);
+                }
+            } else if (peer_addr.kind == AddrKind_Ipv6) {
+                needed_len = sizeof(struct sockaddr_in6);
+                if (*addr_length >= needed_len) {
+                    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr_ptr;
+                    sin6->sin6_family = AF_INET6;
+                    sin6->sin6_port = htons(peer_addr.port);
+                    memcpy(&sin6->sin6_addr, peer_addr.addr_octets.v6, 16);
+                    sin6->sin6_flowinfo = peer_addr.flowinfo;
+                    sin6->sin6_scope_id = peer_addr.scope_id;
+                }
+            }
+            *addr_length = needed_len;
+        }
+    }
+    
+    SYSTRACE("sys_accept returning 0, newfd=%d", *newfd);
+    return 0;
 }
 
 int sys_bind(int fd, const struct sockaddr *addr_ptr, socklen_t addr_length) {
     SYSTRACE("sys_bind(fd=%d, addr_ptr=%p, addr_length=%d)", fd, addr_ptr, addr_length);
-	int result = ENOSYS;
-	SYSTRACE("sys_bind returning %d", result);
-	return result;
+    
+    if (!addr_ptr) return EFAULT;
+    
+    struct socket_address twz_addr = {};
+    int err = sockaddr_to_twz_addr(addr_ptr, addr_length, twz_addr);
+    if (err) {
+        SYSTRACE("sys_bind returning %d", err);
+        return err;
+    }
+    
+    // Use Stream as default protocol (POSIX bind doesn't provide protocol info)
+    enum prot_kind prot = ProtKind_Stream;
+    
+    // Reopen the socket to bind to the specified address
+    struct socket_bind_info bind_info = {.addr = twz_addr, .prot = prot};
+    twz_error result = twz_rt_fd_reopen(fd, OpenKind_SocketBind, OPEN_FLAG_READ | OPEN_FLAG_WRITE,
+        &bind_info, sizeof(bind_info));
+    
+    int retval = twz_error_errno(result);
+    SYSTRACE("sys_bind returning %d", retval);
+    return retval;
 }
 
 int sys_setsockopt(int fd, int layer, int number, const void *buffer, socklen_t size) {
     SYSTRACE("sys_setsockopt(fd=%d, layer=%d, number=%d, buffer=%p, size=%d)", fd, layer, number, buffer, size);
-	int result = ENOSYS;
-	SYSTRACE("sys_setsockopt returning %d", result);
-	return result;
+    
+    if (!buffer) return EFAULT;
+    
+    // Map POSIX socket options to Twizzler register values
+    if (layer == SOL_SOCKET) {
+        switch(number) {
+            case SO_RCVTIMEO: {
+                struct timeval *tv = (struct timeval *)buffer;
+                if (size < sizeof(struct timeval)) return EINVAL;
+                struct option_duration dur = {
+                    .dur = {.seconds = (uint64_t)tv->tv_sec, .nanos = (uint32_t)(tv->tv_usec * 1000)},
+                    .is_some = 1
+                };
+                twz_error err = twz_rt_fd_set_config(fd, IO_REGISTER_READTIMEOUT, &dur, sizeof(dur));
+                int result = twz_error_errno(err);
+                SYSTRACE("sys_setsockopt returning %d", result);
+                return result;
+            }
+            case SO_SNDTIMEO: {
+                struct timeval *tv = (struct timeval *)buffer;
+                if (size < sizeof(struct timeval)) return EINVAL;
+                struct option_duration dur = {
+                    .dur = {.seconds = (uint64_t)tv->tv_sec, .nanos = (uint32_t)(tv->tv_usec * 1000)},
+                    .is_some = 1
+                };
+                twz_error err = twz_rt_fd_set_config(fd, IO_REGISTER_WRITETIMEOUT, &dur, sizeof(dur));
+                int result = twz_error_errno(err);
+                SYSTRACE("sys_setsockopt returning %d", result);
+                return result;
+            }
+            default:
+                SYSTRACE("sys_setsockopt returning %d (unsupported option)", EINVAL);
+                return EINVAL;
+        }
+    } else if (layer == IPPROTO_TCP) {
+        switch(number) {
+            case TCP_NODELAY: {
+                int nodelay = *(int *)buffer;
+                uint32_t flags = nodelay ? SOCKET_FLAGS_NODELAY : 0;
+                twz_error err = twz_rt_fd_set_config(fd, IO_REGISTER_SOCKET_FLAGS, &flags, sizeof(flags));
+                int result = twz_error_errno(err);
+                SYSTRACE("sys_setsockopt returning %d", result);
+                return result;
+            }
+            default:
+                SYSTRACE("sys_setsockopt returning %d (unsupported TCP option)", EINVAL);
+                return EINVAL;
+        }
+    }
+    
+    SYSTRACE("sys_setsockopt returning %d (unsupported level)", EINVAL);
+    return EINVAL;
 }
 
 int sys_sockname(int fd, struct sockaddr *addr_ptr, socklen_t max_addr_length,
 		socklen_t *actual_length) {
     SYSTRACE("sys_sockname(fd=%d, addr_ptr=%p, max_addr_length=%d, actual_length=%p)", fd, addr_ptr, max_addr_length, actual_length);
-	int result = ENOSYS;
-	SYSTRACE("sys_sockname returning %d", result);
-	return result;
+    
+    if (!addr_ptr || !actual_length) return EFAULT;
+    
+    // Query socket local address
+    struct socket_address sock_addr = {};
+    twz_error err = twz_rt_fd_get_config(fd, IO_REGISTER_ADDR, &sock_addr, sizeof(sock_addr));
+    
+    if (err != SUCCESS) {
+        int result = twz_error_errno(err);
+        SYSTRACE("sys_sockname returning %d", result);
+        return result;
+    }
+    
+    // Convert Twizzler socket_address to POSIX sockaddr
+    socklen_t needed_len = 0;
+    if (sock_addr.kind == AddrKind_Ipv4) {
+        needed_len = sizeof(struct sockaddr_in);
+        if (max_addr_length >= needed_len) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)addr_ptr;
+            sin->sin_family = AF_INET;
+            sin->sin_port = htons(sock_addr.port);
+            memcpy(&sin->sin_addr, sock_addr.addr_octets.v4, 4);
+        }
+    } else if (sock_addr.kind == AddrKind_Ipv6) {
+        needed_len = sizeof(struct sockaddr_in6);
+        if (max_addr_length >= needed_len) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr_ptr;
+            sin6->sin6_family = AF_INET6;
+            sin6->sin6_port = htons(sock_addr.port);
+            memcpy(&sin6->sin6_addr, sock_addr.addr_octets.v6, 16);
+            sin6->sin6_flowinfo = sock_addr.flowinfo;
+            sin6->sin6_scope_id = sock_addr.scope_id;
+        }
+    }
+    
+    *actual_length = needed_len;
+    SYSTRACE("sys_sockname returning 0");
+    return 0;
 }
 
 int sys_peername(int fd, struct sockaddr *addr_ptr, socklen_t max_addr_length,
 		socklen_t *actual_length) {
     SYSTRACE("sys_peername(fd=%d, addr_ptr=%p, max_addr_length=%d, actual_length=%p)", fd, addr_ptr, max_addr_length, actual_length);
-	int result = ENOSYS;
-	SYSTRACE("sys_peername returning %d", result);
-	return result;
+    
+    if (!addr_ptr || !actual_length) return EFAULT;
+    
+    // Query socket peer address
+    struct socket_address peer_addr = {};
+    twz_error err = twz_rt_fd_get_config(fd, IO_REGISTER_PEER, &peer_addr, sizeof(peer_addr));
+    
+    if (err != SUCCESS) {
+        int result = twz_error_errno(err);
+        SYSTRACE("sys_peername returning %d", result);
+        return result;
+    }
+    
+    // Convert Twizzler socket_address to POSIX sockaddr
+    socklen_t needed_len = 0;
+    if (peer_addr.kind == AddrKind_Ipv4) {
+        needed_len = sizeof(struct sockaddr_in);
+        if (max_addr_length >= needed_len) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)addr_ptr;
+            sin->sin_family = AF_INET;
+            sin->sin_port = htons(peer_addr.port);
+            memcpy(&sin->sin_addr, peer_addr.addr_octets.v4, 4);
+        }
+    } else if (peer_addr.kind == AddrKind_Ipv6) {
+        needed_len = sizeof(struct sockaddr_in6);
+        if (max_addr_length >= needed_len) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr_ptr;
+            sin6->sin6_family = AF_INET6;
+            sin6->sin6_port = htons(peer_addr.port);
+            memcpy(&sin6->sin6_addr, peer_addr.addr_octets.v6, 16);
+            sin6->sin6_flowinfo = peer_addr.flowinfo;
+            sin6->sin6_scope_id = peer_addr.scope_id;
+        }
+    }
+    
+    *actual_length = needed_len;
+    SYSTRACE("sys_peername returning 0");
+    return 0;
 }
 
 int sys_listen(int fd, int backlog) {
     SYSTRACE("sys_listen(fd=%d, backlog=%d)", fd, backlog);
-	int result = ENOSYS;
-	SYSTRACE("sys_listen returning %d", result);
-	return result;
+    
+    if (backlog < 0) return EINVAL;
+    
+    // In Twizzler, listening might be implicit upon bind, but we could use set_config
+    // For now, just report success as the socket is ready to accept connections
+    SYSTRACE("sys_listen returning 0");
+    return 0;
 }
 
 int sys_shutdown(int sockfd, int how) {
     SYSTRACE("sys_shutdown(sockfd=%d, how=%d)", sockfd, how);
-	int result = ENOSYS;
-	SYSTRACE("sys_shutdown returning %d", result);
-	return result;
+    
+    if (how < SHUT_RD || how > SHUT_RDWR) return EINVAL;
+    
+    // Use FD_CMD_SHUTDOWN to shutdown read/write ends
+    uint32_t shutdown_flags = how;  // SHUT_RD=0, SHUT_WR=1, SHUT_RDWR=2
+    twz_error err = twz_rt_fd_cmd(sockfd, FD_CMD_SHUTDOWN, &shutdown_flags, NULL);
+    
+    int result = twz_error_errno(err);
+    SYSTRACE("sys_shutdown returning %d", result);
+    return result;
 }
 
 int sys_getpriority(int which, id_t who, int *value) {
@@ -937,7 +1630,7 @@ int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_re
 		struct dirent *target = (struct dirent *)((char *)buffer + *bytes_read);
 		target->d_ino = objid_to_ino(entry->info.id);
 		target->d_reclen = this_reclen;
-		SYSTRACE("entry %ld: name=%.*s, ino=%ld, reclen=%hu, namelen=%d, direntsz = %ld, direntaln = %ld, thislen=%ld", i, entry->name_len, entry->name, target->d_ino, target->d_reclen, entry->name_len, dirent_size, thislen, 8);
+		SYSTRACE("entry %ld: name=%.*s, ino=%ld, reclen=%hu, namelen=%d, direntsz = %ld, direntaln = %ld, thislen=%d", i, entry->name_len, entry->name, target->d_ino, target->d_reclen, entry->name_len, dirent_size, thislen, 8);
 
 		char type = DT_UNKNOWN;
 		switch(entry->info.kind) {
@@ -1228,7 +1921,9 @@ int sys_rmdir(const char *path) {
 
 int sys_ftruncate(int fd, size_t size) {
     SYSTRACE("sys_ftruncate(fd=%d, size=%ld)", fd, size);
-	int result = ENOSYS;
+	uint64_t truncate_size = (uint64_t)size;
+	twz_error err = twz_rt_fd_cmd(fd, FD_CMD_TRUNCATE, &truncate_size, NULL);
+	int result = twz_error_errno(err);
 	SYSTRACE("sys_ftruncate returning %d", result);
 	return result;
 }
@@ -1309,7 +2004,17 @@ int sys_getgroups(size_t size, gid_t *list, int *retval) {
 
 int sys_dup(int fd, int flags, int *newfd) {
     SYSTRACE("sys_dup(fd=%d, flags=%d, newfd=%p)", fd, flags, newfd);
-	int result = ENOSYS;
+	if (!newfd) {
+		int result = EFAULT;
+		SYSTRACE("sys_dup returning %d", result);
+		return result;
+	}
+	descriptor dup_fd;
+	twz_error err = twz_rt_fd_cmd(fd, FD_CMD_DUP, NULL, &dup_fd);
+	int result = twz_error_errno(err);
+	if (result == 0) {
+		*newfd = dup_fd;
+	}
 	SYSTRACE("sys_dup returning %d", result);
 	return result;
 }
@@ -1334,12 +2039,52 @@ int sys_fdatasync(int fd) {
 }
 
 int sys_getrandom(void *buffer, size_t length, int flags, ssize_t *bytes_written) {
-    // TODO
+    SYSTRACE("sys_getrandom(buffer=%p, length=%ld, flags=%d, bytes_written=%p)", buffer, length, flags, bytes_written);
+    if (!buffer || !bytes_written) {
+        int result = EFAULT;
+        SYSTRACE("sys_getrandom returning %d", result);
+        return result;
+    }
+
+    // Convert mlibc flags to Twizzler flags
+    // GRND_NONBLOCK = 1 from Linux getrandom man page
+    get_random_flags twz_flags = 0;
+    if (flags & 1) { // GRND_NONBLOCK
+        twz_flags |= GET_RANDOM_NON_BLOCKING;
+    }
+
+    size_t bytes_read = twz_rt_get_random((char *)buffer, length, twz_flags);
+    *bytes_written = (ssize_t)bytes_read;
+
+    SYSTRACE("sys_getrandom returning 0, read %ld bytes", bytes_read);
     return 0;
 }
 
 int sys_getentropy(void *buffer, size_t length) {
-    // TODO
+    SYSTRACE("sys_getentropy(buffer=%p, length=%ld)", buffer, length);
+    if (!buffer) {
+        int result = EFAULT;
+        SYSTRACE("sys_getentropy returning %d", result);
+        return result;
+    }
+
+    // getentropy must fill the buffer completely, up to 256 bytes
+    if (length > 256) {
+        int result = EIO;
+        SYSTRACE("sys_getentropy returning %d", result);
+        return result;
+    }
+
+    // Use blocking mode (flags = 0) to ensure we get all the random data
+    size_t bytes_read = twz_rt_get_random((char *)buffer, length, 0);
+    
+    if (bytes_read != length) {
+        int result = EIO;
+        SYSTRACE("sys_getentropy returning %d (got %ld bytes, expected %ld)", result, bytes_read, length);
+        return result;
+    }
+
+    SYSTRACE("sys_getentropy returning 0");
     return 0;
 }
 

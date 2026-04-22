@@ -29,4 +29,10 @@ extern bool _systrace;
 #define SYSTRACE(...)
 #endif
 
-
+struct twz_thread_args {
+    void *entry;
+    void *user_arg;
+    Tcb *tcb;
+    bool returns_int;
+    bool is_joinable;
+};

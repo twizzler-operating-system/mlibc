@@ -69,6 +69,7 @@ struct spawn_result {
   /// Thread id, if err is set to Success.
   thread_id id;
   twz_error err;
+  void *tcb;
 };
 
 /// Sawn a thread. On success, that thread starts executing concurrently with this function's return.

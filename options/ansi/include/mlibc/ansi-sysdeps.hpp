@@ -23,8 +23,13 @@ namespace [[gnu::visibility("hidden")]] mlibc {
 
 // If *stack is not null, it should point to the lowest addressable byte of the stack.
 // Returns the new stack pointer in *stack and the stack base in *stack_base.
+#if defined(__Twizzler__)
+[[gnu::weak]] int sys_prepare_stack(void **stack, void *entry, void *user_arg, size_t *stack_size, size_t *guard_size, void **stack_base);
+[[gnu::weak]] int sys_clone(void **tcb, pid_t *pid_out, void *entry, void *user_arg, bool);
+#else
 [[gnu::weak]] int sys_prepare_stack(void **stack, void *entry, void *user_arg, void* tcb, size_t *stack_size, size_t *guard_size, void **stack_base);
 [[gnu::weak]] int sys_clone(void *tcb, pid_t *pid_out, void *stack);
+#endif
 
 int sys_futex_wait(int *pointer, int expected, const struct timespec *time);
 int sys_futex_wake(int *pointer);

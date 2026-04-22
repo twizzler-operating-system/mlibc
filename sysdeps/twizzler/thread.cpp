@@ -16,6 +16,7 @@
 #include <frg/stack.hpp>
 #include <frg/expected.hpp>
 #include <mlibc/allocator.hpp>
+#include "sysdeps.h"
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #pragma clang diagnostic ignored "-Wunused-const-variable"
@@ -31,24 +32,56 @@ static void initBasicTcb(Tcb *tcb_ptr) {
 	tcb_ptr->localKeys = frg::construct<frg::array<Tcb::LocalKey, PTHREAD_KEYS_MAX>>(getAllocator());
 }
 
-extern "C" void __mlibc_init_tcb(Tcb *tcb_ptr) {
-    initBasicTcb(tcb_ptr);
-	// TODO
-}
-
 extern "C" void __mlibc_enter_thread(void *entry, void *user_arg) {
-	// TODO
+	// entry points to twz_thread_args structure passed from sys_clone
+	auto args = reinterpret_cast<struct twz_thread_args *>(user_arg);
+	
+	// Get the TCB that was already allocated by the runtime
+	auto tcb = mlibc::get_current_tcb();
+	
+	// Initialize the TCB for this thread
+	initBasicTcb(tcb);
+	
+	// Set the thread attributes that were passed from thread_create
+	tcb->returnValueType = args->returns_int ? TcbThreadReturnValue::Integer : TcbThreadReturnValue::Pointer;
+	tcb->isJoinable = args->is_joinable;
+	
+	// Extract the actual entry function and user_arg from the args structure
+	void *actual_entry = args->entry;
+	void *actual_user_arg = args->user_arg;
+	
+	// Wake any threads waiting for this thread to be created
+	// (they may be waiting on the tid field in the thread handle)
+	mlibc::sys_futex_wake(&tcb->tid);
+	
+	// Free the args structure since we're done with it
+	getAllocator().free(args);
+	
+	// Invoke the actual thread function using the runtime's TCB
+	tcb->invokeThreadFunc(actual_entry, actual_user_arg);
+	
+	// Mark that we've exited
+	__atomic_store_n(&tcb->didExit, 1, __ATOMIC_RELEASE);
+	mlibc::sys_futex_wake(&tcb->didExit);
+	
+	// Exit the thread
+	mlibc::sys_thread_exit();
 }
 
-#include "sysdeps.h"
 
 namespace mlibc {
 
 static constexpr size_t default_stacksize = 0x200000;
 
-int sys_prepare_stack(void **stack, void *entry, void *user_arg, void **tcb, size_t *stack_size, size_t *guard_size, void **stack_base) {
-	SYSTRACE("sys_prepare_stack(stack=%p, entry=%p, user_arg=%p, tcb=%p, stack_size=%p, guard_size=%p, stack_base=%p)", stack, entry, user_arg, tcb, stack_size, guard_size, stack_base);
-	return -ENOSYS;
+int sys_prepare_stack(void **stack, void *entry, void *user_arg, size_t *stack_size, size_t *guard_size, void **stack_base) {
+	SYSTRACE("sys_prepare_stack(stack=%p, entry=%p, user_arg=%p, stack_size=%p, guard_size=%p, stack_base=%p)", stack, entry, user_arg, stack_size, guard_size, stack_base);
+	
+	// The runtime handles stack and TCB allocation
+	// We just need to store entry and user_arg for sys_clone to use
+	if (!*stack_size)
+		*stack_size = default_stacksize;
+	
+	return 0;
 }
 
 // Declared in options/internal/mlibc/tcb.hpp.

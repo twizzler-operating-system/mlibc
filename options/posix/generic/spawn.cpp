@@ -188,6 +188,11 @@ fail:
 	_exit(127);
 }
 
+#if defined(__Twizzler__)
+namespace mlibc {
+int sys_spawn(int *, const char *, char *const*, char *const*);
+}
+#endif
 int posix_spawn(pid_t *__restrict res, const char *__restrict path,
 		const posix_spawn_file_actions_t *file_actions,
 		const posix_spawnattr_t *__restrict attrs,
@@ -206,8 +211,28 @@ int posix_spawn(pid_t *__restrict res, const char *__restrict path,
 	args.attr = attrs ? attrs : &empty_attr;
 	args.argv = argv;
 	args.envp = envp;
+	
+#if defined(__Twizzler__)
+	// On Twizzler, log unsupported flags but continue anyway
+	if(attrs && (attrs->__flags & (POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK | 
+	                              POSIX_SPAWN_SETSID | POSIX_SPAWN_RESETIDS | 
+	                              POSIX_SPAWN_SETPGROUP))) {
+		mlibc::infoLogger() << "mlibc: posix_spawn: ignoring unsupported flags on Twizzler" << frg::endlog;
+	}
+#else
 	pthread_sigmask(SIG_BLOCK, &full_sigset, &args.oldmask);
+#endif
 
+#if defined(__Twizzler__)
+	/* On Twizzler, use the Twizzler spawn API directly */
+	pid_t spawned_pid;
+	int ret = mlibc::sys_spawn(&spawned_pid, path, argv, envp);
+	if(ret) {
+		ec = ret;
+		goto fail;
+	}
+	pid = spawned_pid;
+#else
 	/* The lock guards both against seeing a SIGABRT disposition change
 	 * by abort and against leaking the pipe fd to fork-without-exec. */
 	//LOCK(__abort_lock);
@@ -238,6 +263,7 @@ int posix_spawn(pid_t *__restrict res, const char *__restrict path,
 	}
 
 	close(args.p[0]);
+#endif
 
 	if(!ec && res)
 		*res = pid;

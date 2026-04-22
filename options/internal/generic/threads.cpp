@@ -11,9 +11,6 @@
 #include <mlibc/tcb.hpp>
 #include <mlibc/time-helpers.hpp>
 
-#if !defined(__Twizzler__)
-extern "C" Tcb *__rtld_allocateTcb();
-#endif
 
 namespace {
 
@@ -72,12 +69,9 @@ int thread_once(__mlibc_once *once, void (*func) (void)) {
 }
 
 int thread_create(struct __mlibc_thread_data **__restrict thread, const struct __mlibc_threadattr *__restrict attrp, void *entry, void *__restrict user_arg, bool returns_int) {
+	Tcb *new_tcb = nullptr;
 #if !defined(__Twizzler__)
-	auto new_tcb = __rtld_allocateTcb();
-#else
-    (void)thread;
-    (void)returns_int;
-    Tcb  *new_tcb = nullptr;
+	new_tcb = __rtld_allocateTcb();
 #endif
 	pid_t tid = 0;
 	struct __mlibc_threadattr attr = {};
@@ -101,34 +95,46 @@ int thread_create(struct __mlibc_thread_data **__restrict thread, const struct _
 	}
 
 #if defined(__Twizzler__)
-    int ret = mlibc::sys_prepare_stack(&stack, entry,
-			user_arg, &new_tcb, &attr.__mlibc_stacksize, &attr.__mlibc_guardsize, &new_tcb->stackAddr);
-	if (ret)
+	int ret = mlibc::sys_prepare_stack(&stack, entry,
+			user_arg, &attr.__mlibc_stacksize, &attr.__mlibc_guardsize, nullptr);
+	if (ret) {
 		return ret;
+	}
 #else
+	// On other systems, the TCB is allocated by RTLD
 	int ret = mlibc::sys_prepare_stack(&stack, entry,
 			user_arg, new_tcb, &attr.__mlibc_stacksize, &attr.__mlibc_guardsize, &new_tcb->stackAddr);
 	if (ret)
 		return ret;
+	
+	new_tcb->stackSize = attr.__mlibc_stacksize;
+	new_tcb->guardSize = attr.__mlibc_guardsize;
+	new_tcb->returnValueType = (returns_int) ? TcbThreadReturnValue::Integer : TcbThreadReturnValue::Pointer;
+	new_tcb->isJoinable = (attr.__mlibc_detachstate == __MLIBC_THREAD_CREATE_JOINABLE);
 #endif
 
 	if (!mlibc::sys_clone) {
 		MLIBC_MISSING_SYSDEP();
 		return ENOSYS;
 	}
-	//new_tcb->stackSize = attr.__mlibc_stacksize;
-	//new_tcb->guardSize = attr.__mlibc_guardsize;
-	//new_tcb->returnValueType = (returns_int) ? TcbThreadReturnValue::Integer : TcbThreadReturnValue::Pointer;
-	//new_tcb->isJoinable = (attr.__mlibc_detachstate == __MLIBC_THREAD_CREATE_JOINABLE);
-	//mlibc::sys_clone(new_tcb, &tid, stack);
-	//*thread = reinterpret_cast<struct __mlibc_thread_data *>(new_tcb);
+
+#if !defined(__Twizzler__)
+	int ret2 = mlibc::sys_clone(new_tcb, &tid, stack);
+	if (ret2)
+		return ret2;
 
 	__atomic_store_n(&new_tcb->tid, tid, __ATOMIC_RELAXED);
 	mlibc::sys_futex_wake(&new_tcb->tid);
+#else
+	int ret2 = mlibc::sys_clone((void **)&new_tcb, &tid, entry, user_arg, returns_int);
+	if (ret2)
+		return ret2;
+	__atomic_store_n(&new_tcb->tid, tid, __ATOMIC_RELAXED);
+	mlibc::sys_futex_wake(&new_tcb->tid);
+#endif
 
-	MLIBC_MISSING_SYSDEP();
-
-	return ENOSYS;
+	*thread = reinterpret_cast<struct __mlibc_thread_data *>(new_tcb);
+	return 0;
 }
 
 int thread_join(struct __mlibc_thread_data *thread, void *ret) {

@@ -3,6 +3,10 @@
 #include "types.h"
 #include "fd.h"
 
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
 typedef uint32_t exec_flags;
 
 struct exec_spawn_args {
@@ -15,3 +19,7 @@ struct exec_spawn_args {
 };
 
 extern struct open_result twz_rt_exec_spawn(const struct exec_spawn_args *args);
+
+#if defined(__cplusplus)
+}
+#endif
