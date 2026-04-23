@@ -88,8 +88,14 @@ if not no_headers
 
 	install_headers(
 	    '../../options/linux/include/sys/sysmacros.h',
+	    '../../options/linux/include/sys/sysinfo.h',
+	    '../../options/linux/include/sys/prctl.h',
 	    'include/sys/random.h',
 		subdir: 'sys',
+	)
+
+	install_headers(
+	    '../../options/linux/include/malloc.h',
 	)
 
 	install_headers(

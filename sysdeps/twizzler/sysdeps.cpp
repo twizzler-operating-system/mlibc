@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <stdlib.h>
 
+#include "../../options/linux/include/sys/sysinfo.h"
 #include <twizzler/rt/object.h>
 #include <twizzler/rt/fd.h>
 #include <twizzler/rt/io.h>
@@ -386,17 +387,39 @@ int sys_readv(int fd, const struct iovec *iovs, int iovc, ssize_t *bytes_read) {
     if (bytes_read != nullptr) {
 		*bytes_read = 0;
 	}
-    for(int i = 0; i < iovc; i++) {
-        ssize_t thisread = 0;
-        int e = sys_read(fd, iovs[i].iov_base, iovs[i].iov_len, &thisread);
-        if (bytes_read != nullptr) {
-			*bytes_read += thisread;
-		}
-        if (e != 0) {
-            return e;
-        }
-    }
-    return 0;
+	struct io_ctx ctx = {
+		.flags = 0,
+		.offset = FD_POS,
+		.timeout = NO_DURATION,
+	};
+	struct io_result res = twz_rt_fd_preadv((descriptor)fd,
+		iovs, (size_t)iovc, &ctx);
+	if (res.err == SUCCESS) {
+		if (bytes_read != nullptr)
+			*bytes_read = (ssize_t)res.val;
+		return 0;
+	}
+	return twz_error_errno(res.err);
+}
+
+int sys_writev(int fd, const struct iovec *iovs, int iovc, ssize_t *bytes_written) {
+    SYSTRACE("sys_writev(fd=%d, iovs=%p, iovc=%d, bytes_written=%p)", fd, iovs, iovc, bytes_written);
+    if (bytes_written != nullptr) {
+		*bytes_written = 0;
+	}
+	struct io_ctx ctx = {
+		.flags = 0,
+		.offset = FD_POS,
+		.timeout = NO_DURATION,
+	};
+	struct io_result res = twz_rt_fd_pwritev((descriptor)fd,
+		iovs, (size_t)iovc, &ctx);
+	if (res.err == SUCCESS) {
+		if (bytes_written != nullptr)
+			*bytes_written = (ssize_t)res.val;
+		return 0;
+	}
+	return twz_error_errno(res.err);
 }
 
 int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
@@ -563,6 +586,13 @@ int sys_clock_get(int clock, time_t *secs, long *nanos) {
 int sys_thread_getname(void *tcb, char *name, size_t len) {
     SYSTRACE("sys_thread_getname(tcb=%p, name=%p, len=%ld)", tcb, name, len);
     twz_rt_get_name(tcb, name, &len);
+    return 0;
+}
+
+int sys_thread_setname(void *tcb, const char *name) {
+    SYSTRACE("sys_thread_setname(tcb=%p, name=%s)", tcb, name);
+    (void)tcb;
+    twz_rt_set_name(name);
     return 0;
 }
 
@@ -1131,7 +1161,62 @@ int sys_fork(pid_t *child) {
 
 int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret_pid) {
     SYSTRACE("sys_waitpid(pid=%d, status=%p, flags=%d, ru=%p, ret_pid=%p)", pid, status, flags, ru, ret_pid);
-	return ENOSYS;
+
+    // In Twizzler, spawned process descriptors are used as pids (see sys_spawn).
+    // We don't support wait(-1) or wait(0) yet.
+    if (pid <= 0) {
+        SYSTRACE("sys_waitpid returning ECHILD (pid=%d not supported)", pid);
+        return ECHILD;
+    }
+
+    descriptor fd = (descriptor)pid;
+
+    // Check current status first (handles WNOHANG and already-exited processes).
+    uint64_t proc_status = 0;
+    twz_error err = twz_rt_fd_get_config(fd, IO_REGISTER_STATUS, &proc_status, sizeof(proc_status));
+    if (err != SUCCESS) {
+        SYSTRACE("sys_waitpid returning ECHILD (fd_get_config failed: %d)", twz_error_errno(err));
+        return ECHILD;
+    }
+
+    if (!(proc_status & STATUS_FLAG_TERMINATED)) {
+        if (flags & WNOHANG) {
+            // Not yet exited and caller doesn't want to block.
+            if (ret_pid) *ret_pid = 0;
+            SYSTRACE("sys_waitpid returning 0 (WNOHANG, not exited)");
+            return 0;
+        }
+
+        // Block until the compartment exits: read() on a CompartmentFile blocks until
+        // the compartment state changes (exits or changes), then we re-check status.
+        char dummy;
+        struct io_ctx ctx = {
+            .flags = 0,
+            .offset = FD_POS,
+            .timeout = { .dur = {.seconds = 0, .nanos = 0}, .is_some = 0 },
+        };
+        do {
+            twz_rt_fd_pread(fd, &dummy, 1, &ctx);
+
+            err = twz_rt_fd_get_config(fd, IO_REGISTER_STATUS, &proc_status, sizeof(proc_status));
+            if (err != SUCCESS) {
+                SYSTRACE("sys_waitpid returning ECHILD (fd_get_config failed after wait: %d)", twz_error_errno(err));
+                return ECHILD;
+            }
+        } while (!(proc_status & STATUS_FLAG_TERMINATED));
+    }
+
+    // Process has exited. Extract exit code from lower 32 bits of status word.
+    int exit_code = (int)(proc_status & 0xffffffffu);
+
+    // Encode in POSIX wait status format: normal exit with code in bits [15:8].
+    if (status)
+        *status = (exit_code & 0xff) << 8;
+    if (ret_pid)
+        *ret_pid = pid;
+
+    SYSTRACE("sys_waitpid returning 0, pid=%d exit_code=%d", pid, exit_code);
+    return 0;
 }
 
 int sys_execve(const char *path, char *const argv[], char *const envp[]) {
@@ -1192,14 +1277,21 @@ int sys_setregid(gid_t rgid, gid_t egid) {
 
 int sys_sysinfo(struct sysinfo *info) {
     SYSTRACE("sys_sysinfo(info=%p)", info);
-	int result = ENOSYS;
-	SYSTRACE("sys_sysinfo returning %d", result);
-	return result;
+    if (!info)
+        return EFAULT;
+    struct system_info si = twz_rt_get_sysinfo();
+    struct duration uptime = twz_rt_get_monotonic_time();
+    memset(info, 0, sizeof(*info));
+    info->uptime = (long)uptime.seconds;
+    info->procs = (unsigned short)si.available_parallelism;
+    info->mem_unit = (unsigned int)si.page_size;
+    SYSTRACE("sys_sysinfo returning 0");
+    return 0;
 }
 
 void sys_yield() {
     SYSTRACE("sys_yield()");
-	// TODO
+	twz_rt_yield_now();
 }
 
 extern "C" void __mlibc_enter_thread(void *arg);
@@ -1834,19 +1926,21 @@ int sys_futex_wake(int *pointer) {
 
 int sys_mkdir(const char *path, mode_t mode) {
     SYSTRACE("sys_mkdir(path=%s, mode=%o)", path, mode);
-    sys_libc_log("call to mkdir");
-	int result = ENOSYS;
-	SYSTRACE("sys_mkdir returning %d", result);
-	return result;
+    int result = sys_mkdirat(AT_FDCWD, path, mode);
+    SYSTRACE("sys_mkdir returning %d", result);
+    return result;
 }
-
 
 int sys_mkdirat(int dirfd, const char *path, mode_t mode) {
     SYSTRACE("sys_mkdirat(dirfd=%d, path=%s, mode=%o)", dirfd, path, mode);
-    sys_libc_log("call to mkdirat");
-	int result = ENOSYS;
-	SYSTRACE("sys_mkdirat returning %d", result);
-	return result;
+    if (dirfd != AT_FDCWD) {
+        mlibc::sys_libc_log("sys_mkdirat: relative dirfd not supported");
+        return ENOSYS;
+    }
+    twz_error err = twz_rt_fd_mkns(path, strlen(path));
+    int result = twz_error_errno(err);
+    SYSTRACE("sys_mkdirat returning %d", result);
+    return result;
 }
 
 int sys_mknodat(int dirfd, const char *path, int mode, int dev) {
@@ -1914,9 +2008,10 @@ int sys_renameat(int old_dirfd, const char *old_path, int new_dirfd, const char 
 
 int sys_rmdir(const char *path) {
     SYSTRACE("sys_rmdir(path=%s)", path);
-	int result = ENOSYS;
-	SYSTRACE("sys_rmdir returning %d", result);
-	return result;
+    twz_error err = twz_rt_fd_remove(path, strlen(path));
+    int result = twz_error_errno(err);
+    SYSTRACE("sys_rmdir returning %d", result);
+    return result;
 }
 
 int sys_ftruncate(int fd, size_t size) {
@@ -2026,16 +2121,18 @@ void sys_sync() {
 
 int sys_fsync(int fd) {
     SYSTRACE("sys_fsync(fd=%d)", fd);
-	int result = 0;
-	SYSTRACE("sys_fsync returning %d", result);
-	return result;
+    twz_error err = twz_rt_fd_cmd(fd, FD_CMD_SYNC, NULL, NULL);
+    int result = twz_error_errno(err);
+    SYSTRACE("sys_fsync returning %d", result);
+    return result;
 }
 
 int sys_fdatasync(int fd) {
     SYSTRACE("sys_fdatasync(fd=%d)", fd);
-	int result = 0;
-	SYSTRACE("sys_fdatasync returning %d", result);
-	return result;
+    twz_error err = twz_rt_fd_cmd(fd, FD_CMD_SYNC, NULL, NULL);
+    int result = twz_error_errno(err);
+    SYSTRACE("sys_fdatasync returning %d", result);
+    return result;
 }
 
 int sys_getrandom(void *buffer, size_t length, int flags, ssize_t *bytes_written) {

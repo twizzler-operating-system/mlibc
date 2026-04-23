@@ -3,6 +3,7 @@
 #include "types.h"
 #include "fd.h"
 
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -58,6 +59,13 @@ struct endpoint {
   union endpoint_addrs addr;
 };
 
+#ifndef _MLIBC_POSIX_IOVEC_H
+struct iovec {
+    void *iov_base;
+    size_t iov_len;
+};
+#endif
+
 /// Read from a file. May read less than specified len.
 extern struct io_result twz_rt_fd_pread(descriptor fd, void *buf, size_t len, struct io_ctx *ctx);
 /// Write to a file. May write less than specified len.
@@ -70,18 +78,10 @@ extern struct io_result twz_rt_fd_pread_from(descriptor fd, void *buf, size_t le
 /// Write to a file. May write less than specified len. Send to specified endpoint (e.g. socket address).
 extern struct io_result twz_rt_fd_pwrite_to(descriptor fd, const void *buf, size_t len, struct io_ctx *ctx, const struct endpoint *ep);
 
-/// Io vec, a buffer and a len.
-struct io_vec {
-  /// Pointer to buffer.
-  void *iov_base;
-  /// Length of buffer in bytes.
-  size_t iov_len;
-};
-
 /// Do vectored IO read.
-extern struct io_result twz_rt_fd_preadv(descriptor fd, const struct io_vec *iovs, size_t nr_iovs, struct io_ctx *ctx);
+extern struct io_result twz_rt_fd_preadv(descriptor fd, const struct iovec *iovs, size_t nr_iovs, struct io_ctx *ctx);
 /// Do vectored IO write.
-extern struct io_result twz_rt_fd_pwritev(descriptor fd, const struct io_vec *iovs, size_t nr_iovs, struct io_ctx *ctx);
+extern struct io_result twz_rt_fd_pwritev(descriptor fd, const struct iovec *iovs, size_t nr_iovs, struct io_ctx *ctx);
 
 typedef uint32_t wait_kind;
 const wait_kind WAIT_READ = 1;
