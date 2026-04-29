@@ -539,6 +539,7 @@ int thread_key_create(__mlibc_uintptr *out, void (*destructor)(void *)) {
 
 	key_globals_[key].in_use = true;
 	key_globals_[key].dtor = destructor;
+	key_globals_[key].generation++;
 
 	*out = key;
 
@@ -561,7 +562,6 @@ int thread_key_delete(__mlibc_uintptr key) {
 void *thread_key_get(__mlibc_uintptr key) {
 	auto self = mlibc::get_current_tcb();
 	auto g = frg::guard(&key_mutex_);
-
 	if (key >= PTHREAD_KEYS_MAX || !key_globals_[key].in_use)
 		return nullptr;
 
@@ -576,7 +576,7 @@ void *thread_key_get(__mlibc_uintptr key) {
 int thread_key_set(__mlibc_uintptr key, const void *value) {
 	auto self = mlibc::get_current_tcb();
 	auto g = frg::guard(&key_mutex_);
-
+	
 	if (key >= PTHREAD_KEYS_MAX || !key_globals_[key].in_use)
 		return EINVAL;
 

@@ -32,7 +32,11 @@ static void initBasicTcb(Tcb *tcb_ptr) {
 	tcb_ptr->localKeys = frg::construct<frg::array<Tcb::LocalKey, PTHREAD_KEYS_MAX>>(getAllocator());
 }
 
-extern "C" void __mlibc_enter_thread(void *entry, void *user_arg) {
+extern "C" void __mlibc_init_tcb(void *pointer) {
+	initBasicTcb(reinterpret_cast<Tcb *>(pointer));
+}
+
+extern "C" void __mlibc_enter_thread(void *user_arg) {
 	// entry points to twz_thread_args structure passed from sys_clone
 	auto args = reinterpret_cast<struct twz_thread_args *>(user_arg);
 	
@@ -49,6 +53,7 @@ extern "C" void __mlibc_enter_thread(void *entry, void *user_arg) {
 	// Extract the actual entry function and user_arg from the args structure
 	void *actual_entry = args->entry;
 	void *actual_user_arg = args->user_arg;
+	mlibc::infoLogger() << "Thread " << tcb->tid << " with args" << (void*)user_arg << "started with entry " << actual_entry << " and user_arg " << actual_user_arg << frg::endlog;
 	
 	// Wake any threads waiting for this thread to be created
 	// (they may be waiting on the tid field in the thread handle)

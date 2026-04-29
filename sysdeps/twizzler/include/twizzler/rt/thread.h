@@ -13,9 +13,9 @@ extern "C" {
 typedef uint32_t futex_word;
 
 /// If *ptr == expected, wait until signal, optionally timing out.
-extern bool twz_rt_futex_wait(_Atomic futex_word *ptr, futex_word expected, struct option_duration timeout);
+extern twz_error twz_rt_futex_wait(_Atomic futex_word *ptr, futex_word expected, struct option_duration timeout);
 /// Wake up up to max threads waiting on ptr. If max is set to FUTEX_WAKE_ALL, wake all threads.
-extern bool twz_rt_futex_wake(_Atomic futex_word *ptr, int64_t max);
+extern twz_error twz_rt_futex_wake(_Atomic futex_word *ptr, int64_t max);
 
 /// Wake all threads instead of a maximum number
 const int64_t FUTEX_WAKE_ALL = -1;
@@ -77,6 +77,15 @@ extern struct spawn_result twz_rt_spawn_thread(struct spawn_args args);
 
 /// Wait for a thread to exit, optionally timing out.
 extern twz_error twz_rt_join_thread(thread_id id, struct option_duration timeout);
+
+struct thread_info {
+    thread_id id;
+    void *tcb;
+    objid objid;
+};
+
+const thread_id TWZ_RT_THREAD_ID_SELF = (thread_id)0xFFFFFFFF;
+extern struct thread_info twz_rt_get_thread_info(thread_id id);
 
 #ifdef __cplusplus
 }

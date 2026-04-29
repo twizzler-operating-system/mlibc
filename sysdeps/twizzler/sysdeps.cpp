@@ -1,6 +1,7 @@
 #include "include/twizzler/error.h"
 #include "include/twizzler/rt/info.h"
 #include "include/twizzler/rt/types.h"
+#include "include/twizzler/rt/thread.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -229,6 +230,7 @@ int sys_tcb_set(void *pointer) {
 int sys_anon_allocate(size_t size, void **pointer) {
     SYSTRACE("sys_anon_allocate(size=%ld, pointer=%p)", size, pointer);
     *pointer = twz_rt_malloc(size, 128, ZERO_MEMORY);
+    SYSTRACE("sys_anon_allocate allocated %p", *pointer);
     if (*pointer == NULL) {
         return -1;
     }
@@ -374,6 +376,7 @@ int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
 	}
 	struct io_result res = twz_rt_fd_pread((descriptor)fd, buffer, size, &ctx);
 	if (res.err == SUCCESS) {
+        SYSTRACE("sys_read: read %ld bytes", res.val);
 		if (bytes_read != nullptr) {
 			*bytes_read = (ssize_t)res.val;
 		}
@@ -632,18 +635,18 @@ int sys_clock_getres(int clock, time_t *secs, long *nanos) {
 
 int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat *statbuf) {
     SYSTRACE("sys_stat(fsfdt=%d, fd=%d, path=%s, flags=%d, statbuf=%p)", fsfdt, fd, path, flags, statbuf);
+    int oflags = O_RDONLY;
     if(flags & AT_SYMLINK_NOFOLLOW) {
-        mlibc::sys_libc_log("symlink stat not supported in Twizzler");
-        //return ENOTSUP;
+        oflags |= O_NOFOLLOW;
     }
 
     if (fsfdt == mlibc::fsfd_target::fd_path) {
-        int e = sys_openat(fd, path, O_RDONLY, 0, &fd);
+        int e = sys_openat(fd, path, oflags, 0, &fd);
         if (e != 0) {
             return e;
         }
     } else if (fsfdt == mlibc::fsfd_target::path) {
-        int e = sys_openat(AT_FDCWD, path, O_RDONLY, 0, &fd);
+        int e = sys_openat(AT_FDCWD, path, oflags, 0, &fd);
         if (e != 0) {
             return e;
         }
@@ -652,6 +655,7 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat
     if (!twz_rt_fd_get_info(fd, &info)) {
         return EBADF;
     }
+    SYSTRACE("sys_stat: got fd info: mode=%o, len=%ld", info.unix_mode, info.len);
     statbuf->st_dev = 0;
     statbuf->st_ino = objid_to_ino(info.id);
     statbuf->st_mode = info.unix_mode | 0o777;
@@ -1300,6 +1304,7 @@ int sys_clone(void **tcb, pid_t *pid_out, void *entry, void *user_arg, bool retu
 
 	// Allocate a twz_thread_args and fill it out
 	auto args = (twz_thread_args*)getAllocator().allocate(sizeof(twz_thread_args));
+    SYSTRACE("sys_clone: allocated thread args at %p, with entry %p and user_arg %p", args, entry, user_arg);
 	if (!args)
 		return ENOMEM;
 	
@@ -1412,11 +1417,28 @@ int sys_tcflow(int fd, int action) {
 
 int sys_access(const char *path, int mode) {
     SYSTRACE("sys_access(path=%s, mode=%d)", path, mode);
+    int fd;
+    int e = sys_open(path, O_RDONLY, 0, &fd);
+    if (e != 0) {
+        SYSTRACE("sys_access returning %d (open failed)", e);
+        return e;
+    }
+    twz_rt_fd_close(fd);
+    SYSTRACE("sys_access returning 0");
 	return 0;
 }
 
 int sys_faccessat(int dirfd, const char *pathname, int mode, int flags) {
     SYSTRACE("sys_faccessat(dirfd=%d, pathname=%s, mode=%d, flags=%d)", dirfd, pathname, mode, flags);
+
+    int fd;
+    int e = sys_openat(dirfd, pathname, O_RDONLY, 0, &fd);
+    if (e < 0) {
+        SYSTRACE("sys_faccessat returning %d (open failed)", e);
+        return e;
+    }
+    twz_rt_fd_close(fd);
+    SYSTRACE("sys_faccessat returning 0");
 	return 0;
 }
 
@@ -1854,9 +1876,37 @@ pid_t sys_getpid() {
 
 pid_t sys_gettid() {
     SYSTRACE("sys_gettid()");
-	pid_t result = 1;
+    struct thread_info info = twz_rt_get_thread_info(TWZ_RT_THREAD_ID_SELF);
+	pid_t result = info.id;
 	SYSTRACE("sys_gettid returning %d", result);
 	return result;
+}
+
+int sys_sigaltstack(const stack_t *ss, stack_t *oss) {
+	return 0;
+}
+
+int sys_getrlimit(int resource, struct rlimit *limit) {
+    if(!limit)
+        return EFAULT;
+    switch (resource) {
+        case RLIMIT_NOFILE:
+            limit->rlim_cur = 1024; // Arbitrary limit for max file descriptors
+            limit->rlim_max = 1024;
+            return 0;
+            case RLIMIT_STACK:
+            limit->rlim_cur = 0x200000; // Default 2MB stack
+            limit->rlim_max = 0x200000;
+            return 0;
+            case RLIMIT_CORE:
+            limit->rlim_cur = 0; // No core dumps
+            limit->rlim_max = 0;
+            return 0;
+        default:          
+            limit->rlim_cur = (size_t)-1; // No limit on data segment
+            limit->rlim_max = (size_t)-1;
+            return 0;
+    }
 }
 
 uid_t sys_getuid() {
@@ -1908,20 +1958,24 @@ void sys_exit(int status) {
 #define FUTEX_WAKE 1
 
 int sys_futex_tid() {
-	int result = 1;
+	int result = sys_gettid();
 	return result;
 }
 
 int sys_futex_wait(int *pointer, int expected, const struct timespec *time) {
-	int result = 0;
-	return result;
-	//return ENOSYS;
+	struct option_duration timeout = NO_DURATION;
+	if (time) {
+		timeout.dur.seconds = (uint64_t)time->tv_sec;
+		timeout.dur.nanos = (uint32_t)time->tv_nsec;
+		timeout.is_some = 1;
+	}
+	twz_error err = twz_rt_futex_wait((_Atomic futex_word *)pointer, (futex_word)expected, timeout);
+    return twz_error_errno(err);
 }
 
 int sys_futex_wake(int *pointer) {
-	int result = 0;
-	return result;
-	//return ENOSYS;
+	int e = twz_rt_futex_wake((_Atomic futex_word *)pointer, INT_MAX);
+	return twz_error_errno(e);
 }
 
 int sys_mkdir(const char *path, mode_t mode) {
@@ -1994,7 +2048,7 @@ int sys_fchdir(int fd) {
 
 int sys_rename(const char *old_path, const char *new_path) {
     SYSTRACE("sys_rename(old_path=%s, new_path=%s)", old_path, new_path);
-	int result = ENOSYS;
+	int result = twz_rt_fd_rename(old_path, strlen(old_path), new_path, strlen(new_path));
 	SYSTRACE("sys_rename returning %d", result);
 	return result;
 }
