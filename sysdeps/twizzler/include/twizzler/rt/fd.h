@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include<sys/select.h>
 
 #ifdef __cplusplus
 extern "C" {

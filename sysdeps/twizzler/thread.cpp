@@ -17,6 +17,7 @@
 #include <frg/expected.hpp>
 #include <mlibc/allocator.hpp>
 #include "sysdeps.h"
+#include <twizzler/rt/thread.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #pragma clang diagnostic ignored "-Wunused-const-variable"
@@ -53,7 +54,7 @@ extern "C" void __mlibc_enter_thread(void *user_arg) {
 	// Extract the actual entry function and user_arg from the args structure
 	void *actual_entry = args->entry;
 	void *actual_user_arg = args->user_arg;
-	mlibc::infoLogger() << "Thread " << tcb->tid << " with args" << (void*)user_arg << "started with entry " << actual_entry << " and user_arg " << actual_user_arg << frg::endlog;
+	//mlibc::infoLogger() << "Thread " << tcb->tid << " with args" << (void*)user_arg << "started with entry " << actual_entry << " and user_arg " << actual_user_arg << frg::endlog;
 	
 	// Wake any threads waiting for this thread to be created
 	// (they may be waiting on the tid field in the thread handle)

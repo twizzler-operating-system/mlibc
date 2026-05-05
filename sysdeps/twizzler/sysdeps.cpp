@@ -302,12 +302,12 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
     }
     struct open_info args = {
         .create = co,
-        .flags = open_flags,
+        .flags = 0,
         .len = strlen(path),
         .name = {}
     };
     memcpy(&args.name, path, args.len + 1);
-    struct open_result res = twz_rt_fd_open(OpenKind_Path, 0, &args, sizeof(args));
+    struct open_result res = twz_rt_fd_open(OpenKind_Path, open_flags, &args, sizeof(args));
     if (res.err != SUCCESS) {
         return twz_error_errno(res.err);
     }
@@ -1026,11 +1026,10 @@ int sys_isatty(int fd) {
     if (!twz_rt_fd_get_info(fd, &info)) {
         // Invalid file descriptor
         SYSTRACE("sys_isatty returning 0 (invalid fd)");
-        return 0;
+        return ENOTTY;
     }
     
-    // Check if the FD_IS_TERMINAL flag is set
-    int result = (info.flags & FD_IS_TERMINAL) ? 1 : 0;
+    int result = (info.flags & FD_IS_TERMINAL) ? 0 : ENOTTY;
     
     SYSTRACE("sys_isatty returning %d", result);
     return result;
@@ -1089,7 +1088,29 @@ int sys_pselect(int nfds, fd_set *readfds, fd_set *writefds,
 		fd_set *exceptfds, const struct timespec *timeout, const sigset_t *sigmask, int *num_events) {
         SYSTRACE("sys_pselect(nfds=%d, readfds=%p, writefds=%p, exceptfds=%p, timeout=%p, sigmask=%p, num_events=%p)",
             nfds, readfds, writefds, exceptfds, timeout, sigmask, num_events);
-	return ENOSYS;
+    
+    struct option_duration dur = {};
+    if (timeout) {
+        dur.dur.seconds = timeout->tv_sec;
+        dur.dur.nanos = timeout->tv_nsec;
+        dur.is_some = 1;
+    } else {
+        dur.is_some = 0;
+    }
+
+    (void)sigmask; // Twizzler doesn't have signal masks, so we ignore this parameter for now
+    struct io_result res = twz_rt_fd_select(nfds, readfds, writefds, exceptfds, dur);
+
+    if (res.err != SUCCESS) {
+        int result = twz_error_errno(res.err);
+        SYSTRACE("sys_pselect returning %d", result);
+        return result;
+    }
+        
+    if (num_events) {
+        *num_events = (int)res.val;
+    }
+	return 0;
 }
 
 int sys_pipe(int *fds, int flags) {
@@ -1225,10 +1246,25 @@ int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret
 
 int sys_execve(const char *path, char *const argv[], char *const envp[]) {
     SYSTRACE("sys_execve(path=%s, argv=%p, envp=%p)", path, argv, envp);
-	int result = ENOSYS;
-	SYSTRACE("sys_execve returning %d", result);
-	return result;
+    struct exec_spawn_args args = {
+        .prog = path,
+        .args = argv,
+        .env = envp,
+        .fd_binds = NULL,
+        .fd_bind_count = 0,
+        .flags = 0,
+    };
+	struct open_result res = twz_rt_exec_spawn(&args);
+    if (res.err != SUCCESS) {
+        int result = twz_error_errno(res.err);
+        SYSTRACE("sys_execve returning %d", result);
+        return result;
+    }
+	SYSTRACE("sys_execve exiting");
+    sys_exit(0);
+    return 0;
 }
+
 
 int sys_sigprocmask(int how, const sigset_t *set, sigset_t *old) {
     SYSTRACE("sys_sigprocmask(how=%d, set=%p, old=%p)", how, set, old);
@@ -1797,7 +1833,8 @@ int sys_uname(struct utsname *buf) {
 
 int sys_gethostname(char *buf, size_t bufsize) {
     SYSTRACE("sys_gethostname(buf=%p, bufsize=%ld)", buf, bufsize);
-	int result = ENOSYS;
+    strncpy(buf, "twizzler", bufsize);
+	int result = 0;
 	SYSTRACE("sys_gethostname returning %d", result);
 	return result;
 }
@@ -1875,14 +1912,15 @@ pid_t sys_getpid() {
 }
 
 pid_t sys_gettid() {
-    SYSTRACE("sys_gettid()");
+    //SYSTRACE("sys_gettid()");
     struct thread_info info = twz_rt_get_thread_info(TWZ_RT_THREAD_ID_SELF);
 	pid_t result = info.id;
-	SYSTRACE("sys_gettid returning %d", result);
+	//SYSTRACE("sys_gettid returning %d", result);
 	return result;
 }
 
 int sys_sigaltstack(const stack_t *ss, stack_t *oss) {
+    *oss = *ss;
 	return 0;
 }
 

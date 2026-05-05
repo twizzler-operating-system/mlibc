@@ -283,6 +283,7 @@ int thread_mutex_destroy(struct __mlibc_mutex *mutex) {
 int thread_mutex_timedlock(struct __mlibc_mutex *mutex, const struct timespec *__restrict abstime, clockid_t clockid) {
 	unsigned int this_tid = mlibc::this_tid();
 	unsigned int expected = 0;
+
 	while(true) {
 		if(!expected) {
 			// Try to take the mutex here.
