@@ -325,6 +325,17 @@ int sys_close(int fd) {
     return result;
 }
 
+int sys_fcntl(int fd, int cmd, va_list args, int *result) {
+    SYSTRACE("sys_fcntl(fd=%d, cmd=%d, result=%p)", fd, cmd, result);
+	*result = 0;
+	switch(cmd) {
+		case F_GETFL:
+			*result = O_RDWR;
+			break;
+	}
+	return 0;
+}
+
 int sys_dup2(int fd, int flags, int newfd) {
     SYSTRACE("sys_dup2(fd=%d, flags=%d, newfd=%d)", fd, flags, newfd);
     
@@ -727,16 +738,26 @@ int sys_socket(int domain, int type, int protocol, int *fd) {
     
     if (!fd) return EFAULT;
     if (domain != AF_INET && domain != AF_INET6) return EAFNOSUPPORT;
+    int nonblock = type & SOCK_NONBLOCK;
+    type = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+    SYSTRACE("sys_socket: new type=%d, nonblock=%d", type, nonblock);
     if (type != SOCK_STREAM && type != SOCK_DGRAM) return EINVAL;
     
     // Create an unbound socket
     struct open_result res = twz_rt_fd_open(OpenKind_SocketBind, OPEN_FLAG_READ | OPEN_FLAG_WRITE,
         NULL, 0);
-    
+
     if (res.err != SUCCESS) {
         int result = twz_error_errno(res.err);
         SYSTRACE("sys_socket returning %d", result);
         return result;
+    }
+
+    if (nonblock) {
+        SYSTRACE("sys_socket: setting non-blocking mode");
+        io_flags flags = IO_NONBLOCKING;
+        int r = twz_rt_fd_set_config(res.fd, IO_REGISTER_IO_FLAGS, &flags, sizeof(flags));
+        SYSTRACE("sys_socket: set non-blocking mode result=%lx", r);
     }
     
     *fd = res.fd;
@@ -797,6 +818,7 @@ ssize_t sys_sendto(int fd, const void *buffer, size_t size, int flags, const str
     
     // If address is provided, use pwrite_to to send to that address
     if (sock_addr && addr_length > 0) {
+        SYSTRACE("sys_sendto: got address");
         struct socket_address twz_addr = {};
         int err = sockaddr_to_twz_addr(sock_addr, addr_length, twz_addr);
         if (err) {
@@ -814,7 +836,7 @@ ssize_t sys_sendto(int fd, const void *buffer, size_t size, int flags, const str
         if (res.err == SUCCESS) {
             if (length) *length = (ssize_t)res.val;
             SYSTRACE("sys_sendto returning %ld", res.val);
-            return res.val;
+            return 0;
         }
         
         int result = twz_error_errno(res.err);
@@ -822,17 +844,18 @@ ssize_t sys_sendto(int fd, const void *buffer, size_t size, int flags, const str
         return result;
     }
     
+    SYSTRACE("sys_sendto: no address provided, using pwrite");
     // If no address, just write
     struct io_result res = twz_rt_fd_pwrite((descriptor)fd, buffer, size, &ctx);
     
     if (res.err == SUCCESS) {
         if (length) *length = (ssize_t)res.val;
-        SYSTRACE("sys_sendto returning %ld", res.val);
-        return res.val;
+        SYSTRACE("sys_sendto(ok) returning %ld", res.val);
+        return 0;
     }
     
     int result = twz_error_errno(res.err);
-    SYSTRACE("sys_sendto returning %d", result);
+    SYSTRACE("sys_sendto(err) returning %d", result);
     return result;
 }
 
@@ -884,7 +907,7 @@ ssize_t sys_recvfrom(int fd, void *buffer, size_t size, int flags, struct sockad
             }
             
             SYSTRACE("sys_recvfrom returning %ld", res.val);
-            return res.val;
+            return 0;
         }
         
         int result = twz_error_errno(res.err);
@@ -898,7 +921,7 @@ ssize_t sys_recvfrom(int fd, void *buffer, size_t size, int flags, struct sockad
     if (res.err == SUCCESS) {
         if (length) *length = (ssize_t)res.val;
         SYSTRACE("sys_recvfrom returning %ld", res.val);
-        return res.val;
+        return 0;
     }
     
     int result = twz_error_errno(res.err);
@@ -948,16 +971,6 @@ int sys_msg_recv(int sockfd, struct msghdr *msg, int flags, ssize_t *length) {
     return (int)total_read;
 }
 
-int sys_fcntl(int fd, int cmd, va_list args, int *result) {
-    SYSTRACE("sys_fcntl(fd=%d, cmd=%d, result=%p)", fd, cmd, result);
-	*result = 0;
-	switch(cmd) {
-		case F_GETFL:
-			*result = O_RDWR;
-			break;
-	}
-	return 0;
-}
 
 int sys_getcwd(char *buf, size_t size) {
     SYSTRACE("sys_getcwd(buf=%p, size=%ld)", buf, size);
@@ -1112,6 +1125,49 @@ int sys_pselect(int nfds, fd_set *readfds, fd_set *writefds,
     }
 	return 0;
 }
+
+int sys_ppoll(struct pollfd *fds, nfds_t count, const struct timespec *ts, const sigset_t *mask, int *num_events) {
+    SYSTRACE("sys_ppoll(fds=%p, count=%ld, ts=%p, mask=%p, num_events=%p)", fds, count, ts, mask, num_events);
+    
+    struct option_duration dur = {};
+    if (ts) {
+        dur.dur.seconds = ts->tv_sec;
+        dur.dur.nanos = ts->tv_nsec;
+        dur.is_some = 1;
+    } else {
+        dur.is_some = 0;
+    }
+
+    (void)mask; // Twizzler doesn't have signal masks, so we ignore this parameter for now
+    struct io_result res = twz_rt_fd_poll(fds, count, dur);
+
+    if (res.err != SUCCESS) {
+        int result = twz_error_errno(res.err);
+        SYSTRACE("sys_ppoll returning %d", result);
+        return result;
+    }
+        
+    if (num_events) {
+        *num_events = (int)res.val;
+    }
+	return 0;
+}
+
+int sys_poll(struct pollfd *fds, nfds_t count, int timeout, int *num_events) {
+    struct timespec ts = {};
+    if (timeout >= 0) {
+        ts.tv_sec = timeout / 1000;
+        ts.tv_nsec = (timeout % 1000) * 1000000;
+    } else if (timeout == 0) {
+        ts.tv_sec = 0;
+        ts.tv_nsec = 0;
+    }
+    if (timeout < 0) {
+        return sys_ppoll(fds, count, nullptr, nullptr, num_events);
+    }
+    return sys_ppoll(fds, count, &ts, nullptr, num_events);
+}
+
 
 int sys_pipe(int *fds, int flags) {
     SYSTRACE("sys_pipe(fds=%p, flags=%d)", fds, flags);
@@ -1882,9 +1938,21 @@ int sys_pwrite(int fd, const void *buf, size_t n, off_t off, ssize_t *bytes_writ
 
 int sys_getsockopt(int fd, int layer, int number, void *__restrict buffer, socklen_t *__restrict size) {
     SYSTRACE("sys_getsockopt(fd=%d, layer=%d, number=%d, buffer=%p, size=%p)", fd, layer, number, buffer, size);
-	int result = ENOSYS;
-	SYSTRACE("sys_getsockopt returning %d", result);
-	return result;
+    if(layer != SOL_SOCKET) {
+        SYSTRACE("sys_getsockopt returning %d (unsupported level)", EINVAL);
+        return EINVAL;
+    }
+    switch(number) {
+        case SO_ERROR:
+            memset(buffer, 0, sizeof(int));
+            *size = sizeof(int);
+            SYSTRACE("sys_getsockopt returning 0, SO_ERROR=0");
+            return 0;
+        default:
+	        SYSTRACE("sys_getsockopt returning EINVAL");
+            return EINVAL;
+    }
+    return 0;
 }
 
 int sys_sysconf(int num, long *ret) {

@@ -3,6 +3,7 @@
 #include "types.h"
 #include "fd.h"
 #include <sys/select.h>
+#include <poll.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -88,10 +89,11 @@ const wait_kind WAIT_READ = 1;
 const wait_kind WAIT_WRITE = 2;
 
 /// Get a word and value to wait on for determining if reads or writes are available.
-extern twz_error twz_rt_fd_waitpoint(descriptor fd, wait_kind ek, uint64_t **point, uint64_t *val);
+extern twz_error twz_rt_fd_waitpoint(descriptor fd, wait_kind ek, uint64_t **point, uint64_t *val, _Bool *ready);
 
 /// Select-like operation.
 extern struct io_result twz_rt_fd_select(size_t nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct option_duration timeout);
+extern struct io_result twz_rt_fd_poll(struct pollfd *fds, size_t nfds, struct option_duration timeout);
 
 /// Get a config value for register reg.
 extern twz_error twz_rt_fd_get_config(descriptor fd, uint32_t reg, void *val, size_t len);
