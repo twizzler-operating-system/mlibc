@@ -2,7 +2,7 @@
 
 #include "types.h"
 #include "fd.h"
-
+#include <sys/select.h>
 
 #ifdef __cplusplus
 extern "C" {
