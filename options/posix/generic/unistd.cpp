@@ -872,7 +872,7 @@ long sysconf(int number) {
 			return 1;
 		case _SC_CLK_TCK:
 			// TODO: This should be obsolete?
-			mlibc::infoLogger() << "\e[31mmlibc: sysconf(_SC_CLK_TCK) is obsolete and returns arbitrary value 1000000\e[39m" << frg::endlog;
+			//mlibc::infoLogger() << "\e[31mmlibc: sysconf(_SC_CLK_TCK) is obsolete and returns arbitrary value 1000000\e[39m" << frg::endlog;
 			return 1000000;
 		case _SC_NGROUPS_MAX:
 			mlibc::infoLogger() << "\e[31mmlibc: sysconf(_SC_NGROUPS_MAX) returns fallback value 65536\e[39m" << frg::endlog;

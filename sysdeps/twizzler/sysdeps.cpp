@@ -699,6 +699,11 @@ extern "C" void __mlibc_signal_restore_rt(void);
 int sys_sigaction(int signum, const struct sigaction *act,
 		struct sigaction *oldact) {
         SYSTRACE("sys_sigaction(signum=%d, act=%p, oldact=%p)", signum, act, oldact);
+    if(oldact) {
+        oldact->sa_handler = SIG_DFL;
+        oldact->sa_flags = 0;
+        sigemptyset(&oldact->sa_mask);
+    }
 	return 0;
 }
 
@@ -754,10 +759,8 @@ int sys_socket(int domain, int type, int protocol, int *fd) {
     }
 
     if (nonblock) {
-        SYSTRACE("sys_socket: setting non-blocking mode");
         io_flags flags = IO_NONBLOCKING;
-        int r = twz_rt_fd_set_config(res.fd, IO_REGISTER_IO_FLAGS, &flags, sizeof(flags));
-        SYSTRACE("sys_socket: set non-blocking mode result=%lx", r);
+        twz_rt_fd_set_config(res.fd, IO_REGISTER_IO_FLAGS, &flags, sizeof(flags));
     }
     
     *fd = res.fd;
@@ -1961,10 +1964,13 @@ int sys_sysconf(int num, long *ret) {
 	switch(num) {
     	case _SC_NPROCESSORS_CONF:
             *ret = info.available_parallelism;
+            break;
     	case _SC_NPROCESSORS_ONLN:
     	    *ret = info.available_parallelism;
+            break;
         case _SC_PAGESIZE:
             *ret = info.page_size;
+            break;
 		default: {
 			return EINVAL;
 		}
