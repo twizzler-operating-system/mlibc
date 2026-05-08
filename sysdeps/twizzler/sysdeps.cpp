@@ -835,12 +835,12 @@ ssize_t sys_sendto(int fd, const void *buffer, size_t size, int flags, const str
         
         if (res.err == SUCCESS) {
             if (length) *length = (ssize_t)res.val;
-            SYSTRACE("sys_sendto returning %ld", res.val);
+            SYSTRACE("sys_sendto(ok) returning %ld", res.val);
             return 0;
         }
         
         int result = twz_error_errno(res.err);
-        SYSTRACE("sys_sendto returning %d", result);
+        SYSTRACE("sys_sendto(err) returning %d", result);
         return result;
     }
     
