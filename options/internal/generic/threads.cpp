@@ -229,6 +229,39 @@ __attribute__ ((__noreturn__)) void thread_exit(thread_exit_return ret_val) {
 	mlibc::do_exit();
 }
 
+void run_dtors_for_tcb(Tcb *tcb, int ret_int) {
+	__atomic_fetch_or(&tcb->cancelBits, tcbExitingBit, __ATOMIC_RELAXED);
+	thread_exit_return ret_val = {.integer = ret_int};
+
+	auto hand = tcb->cleanupEnd;
+	while (hand) {
+		auto old = hand;
+		hand->func(hand->arg);
+		hand = hand->prev;
+		frg::destruct(getAllocator(), old);
+	}
+    for (size_t j = 0; j < __MLIBC_THREAD_DESTRUCTOR_ITERATIONS; j++) {
+        for (size_t i = 0; i < PTHREAD_KEYS_MAX; i++) {
+            void *v = (*tcb->localKeys)[i].value;
+            if (!v) continue;
+            key_mutex_.lock();
+            auto dtor = key_globals_[i].dtor;
+            key_mutex_.unlock();
+            if (dtor) {
+                dtor(v);
+                (*tcb->localKeys)[i].value = nullptr;
+            }
+        }
+    }
+	if(tcb->returnValueType == TcbThreadReturnValue::Pointer)
+		tcb->returnValue.voidPtr = ret_val.voidPtr;
+	else if(tcb->returnValueType == TcbThreadReturnValue::Integer)
+		tcb->returnValue.intVal = ret_val.integer;
+
+	__atomic_store_n(&tcb->didExit, 1, __ATOMIC_RELEASE);
+	sys_futex_wake(&tcb->didExit);
+}
+
 static constexpr size_t default_stacksize = 0x200000;
 static constexpr size_t default_guardsize = 4096;
 

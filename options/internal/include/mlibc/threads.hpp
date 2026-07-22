@@ -18,6 +18,7 @@ union thread_exit_return {
 	int integer;
 };
 __attribute__ ((__noreturn__)) void thread_exit(thread_exit_return ret_val);
+void run_dtors_for_tcb(Tcb *tcb, int ret_val);
 
 int thread_mutex_init(struct __mlibc_mutex *__restrict mutex, const struct __mlibc_mutexattr *__restrict attr);
 int thread_mutex_destroy(struct __mlibc_mutex *mutex);

@@ -1,5 +1,6 @@
 #include <mlibc/all-sysdeps.hpp>
 #include <mlibc/thread.hpp>
+#include <mlibc/threads.hpp>
 #include <bits/ensure.h>
 #include <sys/mman.h>
 #include <stdint.h>
@@ -22,7 +23,6 @@
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #pragma clang diagnostic ignored "-Wunused-const-variable"
 
-
 extern uintptr_t __stack_chk_guard;
 static void initBasicTcb(Tcb *tcb_ptr) {
 	tcb_ptr->stackCanary = __stack_chk_guard;
@@ -36,6 +36,7 @@ static void initBasicTcb(Tcb *tcb_ptr) {
 extern "C" void __mlibc_init_tcb(void *pointer) {
 	initBasicTcb(reinterpret_cast<Tcb *>(pointer));
 }
+
 
 extern "C" void __mlibc_enter_thread(void *user_arg) {
 	// entry points to twz_thread_args structure passed from sys_clone
@@ -76,6 +77,10 @@ extern "C" void __mlibc_enter_thread(void *user_arg) {
 
 
 namespace mlibc {
+
+extern "C" void __mlibc_handle_thread_exit(void *pointer, int ret_val) {
+	run_dtors_for_tcb(reinterpret_cast<Tcb *>(pointer), ret_val);
+}
 
 static constexpr size_t default_stacksize = 0x200000;
 

@@ -106,6 +106,8 @@ struct option_exit_code twz_rt_pre_main_hook(void);
 void twz_rt_post_main_hook(void);
 _Noreturn void twz_rt_runtime_entry(const struct runtime_info *arg, struct basic_return (*std_entry)(struct basic_aux), uintptr_t main);
 
+void twz_rt_gc(void);
+
 #ifdef __cplusplus
 }
 #endif
