@@ -31,6 +31,7 @@ static void initBasicTcb(Tcb *tcb_ptr) {
 	tcb_ptr->isJoinable = 1;
 	memset(&tcb_ptr->returnValue, 0, sizeof(tcb_ptr->returnValue));
 	tcb_ptr->localKeys = frg::construct<frg::array<Tcb::LocalKey, PTHREAD_KEYS_MAX>>(getAllocator());
+	tcb_ptr->selfPointer = tcb_ptr;
 }
 
 extern "C" void __mlibc_init_tcb(void *pointer) {

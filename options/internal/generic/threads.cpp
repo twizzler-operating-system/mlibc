@@ -229,9 +229,14 @@ __attribute__ ((__noreturn__)) void thread_exit(thread_exit_return ret_val) {
 	mlibc::do_exit();
 }
 
+void *thread_key_get_with_tcb(Tcb* tcb, __mlibc_uintptr key);
 void run_dtors_for_tcb(Tcb *tcb, int ret_int) {
 	__atomic_fetch_or(&tcb->cancelBits, tcbExitingBit, __ATOMIC_RELAXED);
 	thread_exit_return ret_val = {.integer = ret_int};
+
+	if(tcb->localKeys == nullptr) {
+		mlibc::sys_libc_log("run_dtors_for_tcb: TCB has no local keys\n");
+	}
 
 	auto hand = tcb->cleanupEnd;
 	while (hand) {
@@ -242,15 +247,15 @@ void run_dtors_for_tcb(Tcb *tcb, int ret_int) {
 	}
     for (size_t j = 0; j < __MLIBC_THREAD_DESTRUCTOR_ITERATIONS; j++) {
         for (size_t i = 0; i < PTHREAD_KEYS_MAX; i++) {
-            void *v = (*tcb->localKeys)[i].value;
-            if (!v) continue;
-            key_mutex_.lock();
-            auto dtor = key_globals_[i].dtor;
-            key_mutex_.unlock();
-            if (dtor) {
-                dtor(v);
-                (*tcb->localKeys)[i].value = nullptr;
-            }
+			if (auto v = thread_key_get_with_tcb(tcb, i)) {
+				key_mutex_.lock();
+				auto dtor = key_globals_[i].dtor;
+				key_mutex_.unlock();
+				if (dtor) {
+					dtor(v);
+					(*tcb->localKeys)[i].value = nullptr;
+				}
+			}
         }
     }
 	if(tcb->returnValueType == TcbThreadReturnValue::Pointer)
@@ -593,6 +598,20 @@ int thread_key_delete(__mlibc_uintptr key) {
 	return 0;
 }
 
+void *thread_key_get_with_tcb(Tcb* tcb, __mlibc_uintptr key) {
+	auto g = frg::guard(&key_mutex_);
+	if (key >= PTHREAD_KEYS_MAX || !key_globals_[key].in_use)
+		return nullptr;
+
+	if (key_globals_[key].generation > (*tcb->localKeys)[key].generation) {
+		(*tcb->localKeys)[key].value = nullptr;
+		(*tcb->localKeys)[key].generation = key_globals_[key].generation;
+	}
+
+	return (*tcb->localKeys)[key].value;
+}
+
+#include<stdio.h>
 void *thread_key_get(__mlibc_uintptr key) {
 	auto self = mlibc::get_current_tcb();
 	auto g = frg::guard(&key_mutex_);
