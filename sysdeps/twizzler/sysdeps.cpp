@@ -183,6 +183,9 @@ __aarch64_sme_accessible(void)
 #define STUB_ONLY { __ensure(!"STUB_ONLY function was called"); __builtin_unreachable(); }
 #define UNUSED(x) (void)(x);
 
+// Tick rate reported by both sys_times() and sysconf(_SC_CLK_TCK); the two must agree.
+#define TWZ_CLK_TCK 100
+
 #ifndef MLIBC_BUILDING_RTLD
 extern "C" long __do_syscall_ret(unsigned long ret) {
 	if(ret > -4096UL) {
@@ -251,6 +254,129 @@ int sys_fadvise(int fd, off_t offset, off_t length, int advice) {
 	return result;
 }
 
+// ---------------------------------------------------------------------------
+// Per-descriptor state that the runtime's fd ABI cannot carry for us. Indexed by descriptor
+// and bounded by the RLIMIT_NOFILE that sys_getrlimit reports; descriptors outside the range
+// fall back to conservative defaults rather than being tracked.
+//
+//  - socket_prot_table: the socket type. POSIX picks stream vs. datagram at socket() time, but
+//    the runtime needs the protocol at bind/connect time (twz_rt_fd_reopen's socket_bind_info)
+//    and nothing in the ABI carries it between the two. Without this, bind() on a SOCK_DGRAM
+//    socket creates a TCP listener.
+//
+//  - socket_flags_table: a shadow of the socket flags word. IO_REGISTER_SOCKET_FLAGS cannot
+//    currently be read back -- the runtime's socket get_config passes an unwrapped Result<u32>
+//    to its write_data helper (reference/src/runtime/file/kinds/socket.rs), so a 4-byte read is
+//    size-rejected. The shadow lets set/getsockopt touch individual flag bits without a
+//    read-modify-write, and stays accurate because the libc is that register's only writer.
+//
+//  - fd_cloexec_table / fd_openflags_table: FD_CLOEXEC, the O_RDONLY/O_WRONLY/O_RDWR access
+//    mode, and whether the descriptor was opened O_APPEND. None of these are stored by the
+//    runtime, and fcntl(F_GETFD/F_GETFL) has to report them.
+//
+// All are plain arrays touched with relaxed atomics: each entry is only meaningful while its
+// descriptor is open, and a descriptor cannot be concurrently opened and used.
+#define TWZ_MAX_TRACKED_FD 1024
+#define TWZ_SOCK_PROT_NONE 0
+#define TWZ_SOCK_PROT_STREAM 1
+#define TWZ_SOCK_PROT_DGRAM 2
+
+static unsigned char socket_prot_table[TWZ_MAX_TRACKED_FD];
+static uint32_t socket_flags_table[TWZ_MAX_TRACKED_FD];
+static unsigned char fd_cloexec_table[TWZ_MAX_TRACKED_FD];
+
+// Encoding: bits 0-1 hold the access mode, TWZ_FD_TRACKED marks the entry as populated (so an
+// untracked descriptor can default to O_RDWR), and TWZ_FD_APPEND records O_APPEND.
+#define TWZ_FD_TRACKED 0x4
+#define TWZ_FD_APPEND  0x8
+static unsigned char fd_openflags_table[TWZ_MAX_TRACKED_FD];
+
+static void fd_openflags_set(int fd, int flags) {
+    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
+        return;
+    unsigned char v = (unsigned char)((flags & 03) | TWZ_FD_TRACKED);
+    if (flags & O_APPEND)
+        v |= TWZ_FD_APPEND;
+    __atomic_store_n(&fd_openflags_table[fd], v, __ATOMIC_RELAXED);
+}
+
+// Returns the open flags this libc knows about (access mode plus O_APPEND), defaulting to
+// O_RDWR for descriptors that never passed through sys_openat.
+static int fd_openflags_get(int fd) {
+    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
+        return O_RDWR;
+    unsigned char v = __atomic_load_n(&fd_openflags_table[fd], __ATOMIC_RELAXED);
+    if (!(v & TWZ_FD_TRACKED))
+        return O_RDWR;
+    return (int)(v & 03) | ((v & TWZ_FD_APPEND) ? O_APPEND : 0);
+}
+
+static void fd_cloexec_set(int fd, bool on) {
+    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
+        return;
+    __atomic_store_n(&fd_cloexec_table[fd], on ? 1 : 0, __ATOMIC_RELAXED);
+}
+
+static bool fd_cloexec_get(int fd) {
+    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
+        return false;
+    return __atomic_load_n(&fd_cloexec_table[fd], __ATOMIC_RELAXED) != 0;
+}
+
+static void socket_prot_set(int fd, int type) {
+    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
+        return;
+    unsigned char v = (type == SOCK_DGRAM) ? TWZ_SOCK_PROT_DGRAM : TWZ_SOCK_PROT_STREAM;
+    __atomic_store_n(&socket_prot_table[fd], v, __ATOMIC_RELAXED);
+}
+
+// Drop every per-descriptor record, so a recycled descriptor does not inherit stale state.
+static void fd_state_clear(int fd) {
+    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
+        return;
+    __atomic_store_n(&socket_prot_table[fd], TWZ_SOCK_PROT_NONE, __ATOMIC_RELAXED);
+    __atomic_store_n(&socket_flags_table[fd], 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&fd_cloexec_table[fd], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&fd_openflags_table[fd], 0, __ATOMIC_RELAXED);
+}
+
+// Defaults to stream for descriptors we never saw go through sys_socket, which preserves the
+// old behavior for anything unexpected.
+static enum prot_kind socket_prot_get(int fd) {
+    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
+        return ProtKind_Stream;
+    unsigned char v = __atomic_load_n(&socket_prot_table[fd], __ATOMIC_RELAXED);
+    return (v == TWZ_SOCK_PROT_DGRAM) ? ProtKind_Datagram : ProtKind_Stream;
+}
+
+static int socket_type_get(int fd) {
+    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
+        return SOCK_STREAM;
+    unsigned char v = __atomic_load_n(&socket_prot_table[fd], __ATOMIC_RELAXED);
+    return (v == TWZ_SOCK_PROT_DGRAM) ? SOCK_DGRAM : SOCK_STREAM;
+}
+
+static uint32_t socket_flags_shadow(int fd) {
+    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
+        return 0;
+    return __atomic_load_n(&socket_flags_table[fd], __ATOMIC_RELAXED);
+}
+
+static void socket_flags_shadow_store(int fd, uint32_t flags) {
+    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
+        return;
+    __atomic_store_n(&socket_flags_table[fd], flags, __ATOMIC_RELAXED);
+}
+
+// bind()/connect() reopen the descriptor onto a fresh socket object, which drops any flags
+// already pushed to the runtime. Replay the shadow so options set before bind survive it.
+static void socket_flags_reapply(int fd) {
+    uint32_t flags = socket_flags_shadow(fd);
+    if (flags) {
+        twz_rt_fd_set_config(fd, IO_REGISTER_SOCKET_FLAGS, &flags, sizeof(flags));
+    }
+}
+
 int sys_open(const char *path, int flags, mode_t mode, int *fd) {
     SYSTRACE("sys_open(path=%s, flags=%d, mode=%o, fd=%p)", path, flags, mode, fd);
     int result = sys_openat(AT_FDCWD, path, flags, mode, fd);
@@ -278,15 +404,16 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
             co.kind = CREATE_KIND_EITHER;
         }
     }
+    // The access mode is a 2-bit field, not a bitmask: O_RDONLY is 0, so it cannot be tested
+    // with `flags & O_RDONLY`.
     uint32_t open_flags = 0;
-    if (flags & O_WRONLY) {
-        open_flags |= OPEN_FLAG_WRITE;
-    }
-    if (flags & O_RDONLY) {
-        open_flags |= OPEN_FLAG_READ;
-    }
-    if (flags & O_RDWR) {
-        open_flags |= OPEN_FLAG_READ | OPEN_FLAG_WRITE;
+    switch (flags & 03) {
+        case O_RDONLY: open_flags |= OPEN_FLAG_READ; break;
+        case O_WRONLY: open_flags |= OPEN_FLAG_WRITE; break;
+        case O_RDWR:   open_flags |= OPEN_FLAG_READ | OPEN_FLAG_WRITE; break;
+        default:
+            SYSTRACE("sys_openat: bad access mode in flags=%d", flags);
+            return EINVAL;
     }
     if (flags & O_TRUNC) {
         open_flags |= OPEN_FLAG_TRUNCATE;
@@ -294,23 +421,65 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
     if (flags & O_APPEND) {
         open_flags |= OPEN_FLAG_TAIL;
     }
-    //if (flags & O_SYMLINK) {
-    //    open_flags |= OPEN_FLAG_SYMLINK;
-    //}
+    if (flags & O_NOFOLLOW) {
+        // Make the link itself the object of the open rather than its target. This is what
+        // sys_stat needs to implement lstat(); for a plain open() we reject a symlink result
+        // below, per POSIX.
+        open_flags |= OPEN_FLAG_SYMLINK;
+    }
+    // O_SEARCH/O_EXEC/O_PATH are all the same bit here, and want no data access.
     if (flags & O_SEARCH) {
         open_flags |= OPEN_FLAG_READ;
+    }
+    // args.name is a fixed NAME_DATA_MAX buffer, but PATH_MAX is larger.
+    size_t path_len = strlen(path);
+    if (path_len >= NAME_DATA_MAX) {
+        SYSTRACE("sys_openat: path length %ld exceeds NAME_DATA_MAX", path_len);
+        return ENAMETOOLONG;
     }
     struct open_info args = {
         .create = co,
         .flags = 0,
-        .len = strlen(path),
+        .len = path_len,
         .name = {}
     };
-    memcpy(&args.name, path, args.len + 1);
+    memcpy(&args.name, path, path_len + 1);
     struct open_result res = twz_rt_fd_open(OpenKind_Path, open_flags, &args, sizeof(args));
     if (res.err != SUCCESS) {
         return twz_error_errno(res.err);
     }
+
+    // O_DIRECTORY and O_NOFOLLOW are both constraints on what we were allowed to open, and the
+    // runtime resolves by name kind rather than checking them, so enforce them here.
+    if (flags & (O_DIRECTORY | O_NOFOLLOW)) {
+        struct fd_info info;
+        if (twz_rt_fd_get_info(res.fd, &info)) {
+            if ((flags & O_DIRECTORY) && info.kind != FdKind_Directory) {
+                twz_rt_fd_close(res.fd);
+                SYSTRACE("sys_openat returning ENOTDIR (O_DIRECTORY, kind=%d)", info.kind);
+                return ENOTDIR;
+            }
+            // O_PATH opens are allowed to name a symlink; ordinary ones are not.
+            if ((flags & O_NOFOLLOW) && !(flags & O_PATH) && info.kind == FdKind_SymLink) {
+                twz_rt_fd_close(res.fd);
+                SYSTRACE("sys_openat returning ELOOP (O_NOFOLLOW on a symlink)");
+                return ELOOP;
+            }
+        }
+    }
+
+    if (flags & O_NONBLOCK) {
+        io_flags ioflags = IO_NONBLOCKING;
+        twz_rt_fd_set_config(res.fd, IO_REGISTER_IO_FLAGS, &ioflags, sizeof(ioflags));
+    }
+
+    // Record what fcntl(F_GETFD/F_GETFL) will need to report. Note that FD_CLOEXEC is only
+    // bookkeeping: nothing closes these descriptors across an exec yet, because sys_execve
+    // replaces the process without consulting the table.
+    fd_state_clear(res.fd);
+    fd_openflags_set(res.fd, flags);
+    fd_cloexec_set(res.fd, (flags & O_CLOEXEC) != 0);
+
     if(fd) {
         *fd = res.fd;
     }
@@ -319,6 +488,7 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
 
 int sys_close(int fd) {
     SYSTRACE("sys_close(fd=%d)", fd);
+    fd_state_clear(fd);
     twz_rt_fd_close(fd);
     int result = 0;
     SYSTRACE("sys_close returning %d", result);
@@ -327,50 +497,166 @@ int sys_close(int fd) {
 
 int sys_fcntl(int fd, int cmd, va_list args, int *result) {
     SYSTRACE("sys_fcntl(fd=%d, cmd=%d, result=%p)", fd, cmd, result);
+	if (!result)
+		return EFAULT;
 	*result = 0;
-	switch(cmd) {
-		case F_GETFL:
-			*result = O_RDWR;
-			break;
+
+	// Validate the descriptor up front so every command below can assume it exists. The
+	// negative check has to come first: the runtime's fd table does `fd.try_into().unwrap()`
+	// from i32 to usize, which panics rather than erroring.
+	struct fd_info info;
+	if (fd < 0 || !twz_rt_fd_get_info(fd, &info)) {
+		SYSTRACE("sys_fcntl returning EBADF");
+		return EBADF;
 	}
-	return 0;
+
+	switch(cmd) {
+		case F_DUPFD:
+		case F_DUPFD_CLOEXEC: {
+			// F_DUPFD must return the lowest free descriptor at or above the caller's minimum.
+			// FD_CMD_DUP2 is no help (it would clobber an open descriptor at exactly min_fd),
+			// so use FD_CMD_DUP -- which returns the lowest free descriptor -- and keep hold of
+			// the too-low results so they aren't handed back again, until one clears the bar.
+			// Only free slots are ever taken, so this cannot disturb another thread's
+			// descriptors.
+			int min_fd = va_arg(args, int);
+			if (min_fd < 0 || min_fd >= TWZ_MAX_TRACKED_FD)
+				return EINVAL;
+			// Worst case every descriptor below min_fd is free and has to be held.
+			descriptor held[TWZ_MAX_TRACKED_FD];
+			size_t nr_held = 0;
+			int err = 0;
+			descriptor dup_fd = -1;
+			for (;;) {
+				twz_error e = twz_rt_fd_cmd(fd, FD_CMD_DUP, NULL, &dup_fd);
+				if (e != SUCCESS) {
+					err = twz_error_errno(e);
+					break;
+				}
+				if (dup_fd >= min_fd)
+					break;
+				if (nr_held == sizeof(held) / sizeof(held[0])) {
+					// Every low descriptor we could hold is still below min_fd.
+					twz_rt_fd_close(dup_fd);
+					err = EMFILE;
+					break;
+				}
+				held[nr_held++] = dup_fd;
+			}
+			for (size_t i = 0; i < nr_held; i++) {
+				twz_rt_fd_close(held[i]);
+			}
+			if (err) {
+				SYSTRACE("sys_fcntl(F_DUPFD) returning %d", err);
+				return err;
+			}
+			fd_state_clear(dup_fd);
+			fd_openflags_set(dup_fd, fd_openflags_get(fd));
+			socket_prot_set(dup_fd, socket_type_get(fd));
+			fd_cloexec_set(dup_fd, cmd == F_DUPFD_CLOEXEC);
+			*result = dup_fd;
+			SYSTRACE("sys_fcntl(F_DUPFD) returning 0, newfd=%d", dup_fd);
+			return 0;
+		}
+		case F_GETFD:
+			*result = fd_cloexec_get(fd) ? FD_CLOEXEC : 0;
+			return 0;
+		case F_SETFD: {
+			int arg = va_arg(args, int);
+			fd_cloexec_set(fd, (arg & FD_CLOEXEC) != 0);
+			return 0;
+		}
+		case F_GETFL: {
+			io_flags ioflags = 0;
+			twz_error e = twz_rt_fd_get_config(fd, IO_REGISTER_IO_FLAGS, &ioflags, sizeof(ioflags));
+			int flags = fd_openflags_get(fd);
+			if (e == SUCCESS && (ioflags & IO_NONBLOCKING)) {
+				flags |= O_NONBLOCK;
+			}
+			*result = flags;
+			SYSTRACE("sys_fcntl(F_GETFL) returning 0, flags=%d", flags);
+			return 0;
+		}
+		case F_SETFL: {
+			// POSIX says the access mode and creation flags are ignored here, leaving
+			// O_NONBLOCK and O_APPEND. Append is fixed at open time by this ABI
+			// (OPEN_FLAG_TAIL), so a request to turn it on afterwards has to be refused: it is
+			// what fdopen(fd, "a") does, and quietly succeeding would leave writes going to the
+			// current offset instead of the end of the file.
+			int arg = va_arg(args, int);
+			if ((arg & O_APPEND) && !(fd_openflags_get(fd) & O_APPEND)) {
+				SYSTRACE("sys_fcntl(F_SETFL) returning EINVAL (cannot add O_APPEND after open)");
+				return EINVAL;
+			}
+			io_flags ioflags = 0;
+			twz_error e = twz_rt_fd_get_config(fd, IO_REGISTER_IO_FLAGS, &ioflags, sizeof(ioflags));
+			if (e != SUCCESS)
+				return twz_error_errno(e);
+			if (arg & O_NONBLOCK) {
+				ioflags |= IO_NONBLOCKING;
+			} else {
+				ioflags &= ~IO_NONBLOCKING;
+			}
+			return twz_error_errno(
+				twz_rt_fd_set_config(fd, IO_REGISTER_IO_FLAGS, &ioflags, sizeof(ioflags)));
+		}
+		case F_GETLK: {
+			// There is no cross-compartment file locking, and a single writer per object is the
+			// only case that exists, so report the range as unlocked rather than failing --
+			// callers that require locks to work (SQLite) treat an error as fatal.
+			struct flock *lk = va_arg(args, struct flock *);
+			if (!lk)
+				return EFAULT;
+			lk->l_type = F_UNLCK;
+			return 0;
+		}
+		case F_SETLK:
+		case F_SETLKW: {
+			struct flock *lk = va_arg(args, struct flock *);
+			if (!lk)
+				return EFAULT;
+			if (lk->l_type != F_RDLCK && lk->l_type != F_WRLCK && lk->l_type != F_UNLCK)
+				return EINVAL;
+			SYSTRACE("sys_fcntl(F_SETLK): accepting lock without effect");
+			return 0;
+		}
+		default:
+			// F_GETOWN/F_SETOWN and the rest need signals or have no analogue. Returning 0 here
+			// would tell the caller its request took effect.
+			SYSTRACE("sys_fcntl returning EINVAL (unhandled cmd %d)", cmd);
+			return EINVAL;
+	}
 }
 
 int sys_dup2(int fd, int flags, int newfd) {
     SYSTRACE("sys_dup2(fd=%d, flags=%d, newfd=%d)", fd, flags, newfd);
-    
-    if (fd == newfd) {
-        // Duplicating to the same descriptor is a no-op
-        SYSTRACE("sys_dup2 returning 0 (fd == newfd)");
-        return 0;
-    }
-    
-    // First, close the target descriptor if it's open
-    twz_rt_fd_close(newfd);
-    
-    // Now duplicate the source descriptor
-    descriptor dup_fd;
-    twz_error err = twz_rt_fd_cmd(fd, FD_CMD_DUP, NULL, &dup_fd);
-    int result = twz_error_errno(err);
-    
-    if (result != 0) {
-        SYSTRACE("sys_dup2 returning %d (dup failed)", result);
-        return result;
-    }
-    
-    // If the duplicated descriptor is not the target descriptor, we need to close the dup
-    // and try a different approach. In a real implementation with full fd control, we might
-    // use dup2-specific syscalls, but Twizzler's FD_CMD_DUP doesn't guarantee a specific fd.
-    // For now, we assume it returns the requested fd or we close and handle appropriately.
-    if (dup_fd != newfd) {
-        // The duplicated fd is not what we wanted, this would require more complex logic
-        // In practice, Twizzler's fd management should handle this, but as a fallback
-        // we close both and report an error
-        twz_rt_fd_close(dup_fd);
-        SYSTRACE("sys_dup2 returning %d (dup returned wrong fd)", EBADF);
+
+    // Guard negative descriptors before they reach the runtime: its fd table does
+    // `fd.try_into().unwrap()` from i32 to usize, which panics rather than erroring.
+    if (fd < 0 || newfd < 0) {
         return EBADF;
     }
-    
+
+    // FD_CMD_DUP2 places the duplicate at a chosen descriptor and closes whatever was there,
+    // which is exactly dup2's contract. FD_CMD_DUP cannot serve here: it returns the lowest
+    // free descriptor, so it would only land on newfd by luck.
+    descriptor target = newfd;
+    descriptor out = -1;
+    twz_error err = twz_rt_fd_cmd(fd, FD_CMD_DUP2, &target, &out);
+    int result = twz_error_errno(err);
+    if (result != 0) {
+        SYSTRACE("sys_dup2 returning %d", result);
+        return result;
+    }
+
+    // dup2(fd, fd) validates fd and changes nothing, so leave the recorded state alone.
+    if (fd != newfd) {
+        fd_state_clear(newfd);
+        fd_openflags_set(newfd, fd_openflags_get(fd));
+        socket_prot_set(newfd, socket_type_get(fd));
+        fd_cloexec_set(newfd, (flags & O_CLOEXEC) != 0);
+    }
+
     SYSTRACE("sys_dup2 returning 0");
     return 0;
 }
@@ -581,8 +867,17 @@ int sys_clock_get(int clock, time_t *secs, long *nanos) {
             break;
         case CLOCK_MONOTONIC:
         case CLOCK_MONOTONIC_COARSE:
+        case CLOCK_MONOTONIC_RAW:
+        case CLOCK_BOOTTIME:
         //case CLOCK_UPTIME:
         //case CLOCK_UPTIME_RAW:
+            dur = twz_rt_get_monotonic_time();
+            break;
+        case CLOCK_PROCESS_CPUTIME_ID:
+        case CLOCK_THREAD_CPUTIME_ID:
+            // No CPU-time accounting is exposed by the runtime, so elapsed time stands in.
+            // Approximate, but callers that only need a monotonic timer (most profiling and
+            // benchmarking code) work, where EINVAL would fail them outright.
             dur = twz_rt_get_monotonic_time();
             break;
         default:
@@ -622,6 +917,10 @@ int sys_clock_getres(int clock, time_t *secs, long *nanos) {
     switch (clock) {
         case CLOCK_REALTIME:
         case CLOCK_MONOTONIC:
+        case CLOCK_MONOTONIC_RAW:
+        case CLOCK_BOOTTIME:
+        case CLOCK_PROCESS_CPUTIME_ID:
+        case CLOCK_THREAD_CPUTIME_ID:
         //case CLOCK_UPTIME:
             *secs = 0;
             *nanos = 1;  // 1 nanosecond resolution
@@ -651,25 +950,45 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat
         oflags |= O_NOFOLLOW;
     }
 
+    // Track whether the descriptor is ours, so we don't leak one per stat() call.
+    bool opened_fd = false;
     if (fsfdt == mlibc::fsfd_target::fd_path) {
         int e = sys_openat(fd, path, oflags, 0, &fd);
         if (e != 0) {
             return e;
         }
+        opened_fd = true;
     } else if (fsfdt == mlibc::fsfd_target::path) {
         int e = sys_openat(AT_FDCWD, path, oflags, 0, &fd);
         if (e != 0) {
             return e;
         }
+        opened_fd = true;
     }
     struct fd_info info;
-    if (!twz_rt_fd_get_info(fd, &info)) {
+    bool got_info = twz_rt_fd_get_info(fd, &info);
+    if (opened_fd) {
+        twz_rt_fd_close(fd);
+    }
+    if (!got_info) {
         return EBADF;
     }
     SYSTRACE("sys_stat: got fd info: mode=%o, len=%ld", info.unix_mode, info.len);
     statbuf->st_dev = 0;
     statbuf->st_ino = objid_to_ino(info.id);
-    statbuf->st_mode = info.unix_mode | 0o777;
+    // The runtime reports a full mode (type bits | permissions). Only synthesize one if it
+    // didn't fill the field in, otherwise we'd clobber the real permissions.
+    statbuf->st_mode = info.unix_mode;
+    if ((statbuf->st_mode & S_IFMT) == 0) {
+        switch (info.kind) {
+            case FdKind_Directory: statbuf->st_mode = S_IFDIR | 0755; break;
+            case FdKind_SymLink:   statbuf->st_mode = S_IFLNK | 0777; break;
+            case FdKind_Socket:    statbuf->st_mode = S_IFSOCK | 0777; break;
+            case FdKind_Pipe:      statbuf->st_mode = S_IFIFO | 0666; break;
+            case FdKind_Pty:       statbuf->st_mode = S_IFCHR | 0666; break;
+            default:               statbuf->st_mode = S_IFREG | 0777; break;
+        }
+    }
     statbuf->st_nlink = 1;
     statbuf->st_uid = 0;
     statbuf->st_gid = 0;
@@ -762,7 +1081,10 @@ int sys_socket(int domain, int type, int protocol, int *fd) {
         io_flags flags = IO_NONBLOCKING;
         twz_rt_fd_set_config(res.fd, IO_REGISTER_IO_FLAGS, &flags, sizeof(flags));
     }
-    
+
+    // Remember the type so bind()/connect() can pass the right prot_kind.
+    socket_prot_set(res.fd, type);
+
     *fd = res.fd;
     SYSTRACE("sys_socket returning 0, fd=%d", *fd);
     return 0;
@@ -789,22 +1111,24 @@ int sys_msg_send(int sockfd, const struct msghdr *msg, int flags, ssize_t *lengt
         struct io_result res = twz_rt_fd_pwrite((descriptor)sockfd, iov->iov_base, iov->iov_len, &ctx);
         
         if (res.err != SUCCESS) {
+            // A short write is still a success; the count goes out via *length.
             if (total_sent > 0) {
                 if (length) *length = total_sent;
-                SYSTRACE("sys_msg_send returning %ld (partial)", total_sent);
-                return total_sent;
+                SYSTRACE("sys_msg_send returning 0 (partial, %ld bytes)", total_sent);
+                return 0;
             }
             int result = twz_error_errno(res.err);
             SYSTRACE("sys_msg_send returning %d", result);
             return result;
         }
-        
+
         total_sent += res.val;
     }
-    
+
     if (length) *length = total_sent;
-    SYSTRACE("sys_msg_send returning %ld", total_sent);
-    return (int)total_sent;
+    SYSTRACE("sys_msg_send returning 0 (%ld bytes)", total_sent);
+    // mlibc's contract is 0-or-errno, not a byte count.
+    return 0;
 }
 
 ssize_t sys_sendto(int fd, const void *buffer, size_t size, int flags, const struct sockaddr *sock_addr, socklen_t addr_length, ssize_t *length) {
@@ -953,37 +1277,45 @@ int sys_msg_recv(int sockfd, struct msghdr *msg, int flags, ssize_t *length) {
         struct io_result res = twz_rt_fd_pread((descriptor)sockfd, iov->iov_base, iov->iov_len, &ctx);
         
         if (res.err != SUCCESS) {
+            // A short read is still a success; the count goes out via *length.
             if (total_read > 0) {
                 if (length) *length = total_read;
-                SYSTRACE("sys_msg_recv returning %ld (partial)", total_read);
-                return (int)total_read;
+                SYSTRACE("sys_msg_recv returning 0 (partial, %ld bytes)", total_read);
+                return 0;
             }
             int result = twz_error_errno(res.err);
             SYSTRACE("sys_msg_recv returning %d", result);
             return result;
         }
-        
+
         total_read += res.val;
-        
+
         // If we got 0 bytes, EOF was reached
         if (res.val == 0) break;
     }
-    
+
     if (length) *length = total_read;
-    SYSTRACE("sys_msg_recv returning %ld", total_read);
-    return (int)total_read;
+    SYSTRACE("sys_msg_recv returning 0 (%ld bytes)", total_read);
+    // mlibc's contract is 0-or-errno, not a byte count.
+    return 0;
 }
 
 
 int sys_getcwd(char *buf, size_t size) {
     SYSTRACE("sys_getcwd(buf=%p, size=%ld)", buf, size);
-    *buf = '/';
-    *(buf + 1) = 0;
-    int result = 0;
-    SYSTRACE("sys_getcwd returning %d", result);
-    return result;
-    //sys_libc_log("call to getcwd");
-	//return ENOSYS;
+    if (!buf) {
+        return EFAULT;
+    }
+    // There is no per-process cwd yet (sys_chdir is ENOSYS), so this is always the root.
+    // A real implementation would track it via the NameRoot_Current nameroot.
+    if (size < 2) {
+        SYSTRACE("sys_getcwd returning ERANGE (size=%ld)", size);
+        return ERANGE;
+    }
+    buf[0] = '/';
+    buf[1] = '\0';
+    SYSTRACE("sys_getcwd returning 0");
+    return 0;
 }
 
 int sys_unlinkat(int dfd, const char *path, int flags) {
@@ -1067,12 +1399,45 @@ int sys_isatty(int fd) {
 int sys_ioctl(int fd, unsigned long request, void *arg, int *result) {
     SYSTRACE("sys_ioctl(fd=%d, request=%lu, arg=%p, result=%p)", fd, request, arg, result);
 
+    if (result) {
+        *result = 0;
+    }
     switch(request) {
         case TIOCGWINSZ:
+            if (!arg) return EFAULT;
             return twz_error_errno(twz_rt_fd_get_config(fd, IO_REGISTER_WINSIZE, arg, sizeof(struct winsize)));
-        default: *result = 0;
+        case TIOCSWINSZ:
+            if (!arg) return EFAULT;
+            return twz_error_errno(twz_rt_fd_set_config(fd, IO_REGISTER_WINSIZE, arg, sizeof(struct winsize)));
+        case FIONBIO: {
+            if (!arg) return EFAULT;
+            io_flags ioflags = 0;
+            twz_error err = twz_rt_fd_get_config(fd, IO_REGISTER_IO_FLAGS, &ioflags, sizeof(ioflags));
+            if (err != SUCCESS) return twz_error_errno(err);
+            if (*(int *)arg) {
+                ioflags |= IO_NONBLOCKING;
+            } else {
+                ioflags &= ~IO_NONBLOCKING;
+            }
+            return twz_error_errno(twz_rt_fd_set_config(fd, IO_REGISTER_IO_FLAGS, &ioflags, sizeof(ioflags)));
+        }
+        case TIOCGPGRP:
+        case TIOCGSID:
+            // Single process group / session, matching sys_getpgid and sys_getsid.
+            if (!arg) return EFAULT;
+            *(pid_t *)arg = 1;
+            return 0;
+        case TIOCSPGRP:
+        case TIOCSCTTY:
+            // Nothing to do with one process group and one terminal.
+            return 0;
+        default:
+            // Reporting success for every unrecognized request means callers cannot tell that
+            // their request was ignored. FIONREAD in particular has no ABI support today, so
+            // callers need to see the failure and fall back.
+            SYSTRACE("sys_ioctl returning ENOTTY (unhandled request %lu)", request);
+            return ENOTTY;
     }
-	return 0;
 }
 
 int sys_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
@@ -1087,15 +1452,18 @@ int sys_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
         return err;
     }
     
-    // Use Stream as default protocol (POSIX connect doesn't provide protocol info)
-    enum prot_kind prot = ProtKind_Stream;
-    
+    // POSIX connect() carries no protocol info, so use the type recorded at socket() time.
+    enum prot_kind prot = socket_prot_get(sockfd);
+
     // Reconnect the socket to the new address
     struct socket_bind_info bind_info = {.addr = twz_addr, .prot = prot};
     twz_error result = twz_rt_fd_reopen(sockfd, OpenKind_SocketConnect, OPEN_FLAG_READ | OPEN_FLAG_WRITE,
         &bind_info, sizeof(bind_info));
-    
+
     int retval = twz_error_errno(result);
+    if (retval == 0) {
+        socket_flags_reapply(sockfd);
+    }
     SYSTRACE("sys_connect returning %d", retval);
     return retval;
 }
@@ -1526,9 +1894,10 @@ int sys_access(const char *path, int mode) {
 int sys_faccessat(int dirfd, const char *pathname, int mode, int flags) {
     SYSTRACE("sys_faccessat(dirfd=%d, pathname=%s, mode=%d, flags=%d)", dirfd, pathname, mode, flags);
 
-    int fd;
+    int fd = -1;
+    // sys_openat reports a positive errno, so this must not test for e < 0.
     int e = sys_openat(dirfd, pathname, O_RDONLY, 0, &fd);
-    if (e < 0) {
+    if (e != 0) {
         SYSTRACE("sys_faccessat returning %d (open failed)", e);
         return e;
     }
@@ -1555,7 +1924,10 @@ int sys_accept(int fd, int *newfd, struct sockaddr *addr_ptr, socklen_t *addr_le
     }
     
     *newfd = res.fd;
-    
+
+    // An accepted connection is always a stream, whatever the listener was recorded as.
+    socket_prot_set(res.fd, SOCK_STREAM);
+
     // If address buffer provided, fill it with peer address
     if (addr_ptr && addr_length && *addr_length > 0) {
         struct socket_address peer_addr = {};
@@ -1602,73 +1974,137 @@ int sys_bind(int fd, const struct sockaddr *addr_ptr, socklen_t addr_length) {
         return err;
     }
     
-    // Use Stream as default protocol (POSIX bind doesn't provide protocol info)
-    enum prot_kind prot = ProtKind_Stream;
-    
+    // POSIX bind() carries no protocol info, so use the type recorded at socket() time.
+    enum prot_kind prot = socket_prot_get(fd);
+
     // Reopen the socket to bind to the specified address
     struct socket_bind_info bind_info = {.addr = twz_addr, .prot = prot};
     twz_error result = twz_rt_fd_reopen(fd, OpenKind_SocketBind, OPEN_FLAG_READ | OPEN_FLAG_WRITE,
         &bind_info, sizeof(bind_info));
-    
+
     int retval = twz_error_errno(result);
+    if (retval == 0) {
+        socket_flags_reapply(fd);
+    }
     SYSTRACE("sys_bind returning %d", retval);
     return retval;
 }
 
+// Set one bit of the socket flags word. All the flags (NODELAY, ONLYV6, BROADCAST, ...) share a
+// single register, so this works from the shadow copy rather than overwriting the whole word --
+// see the comment on socket_flags_table for why it cannot be read back from the runtime.
+static int socket_flag_set(int fd, uint32_t bit, bool on) {
+    uint32_t flags = socket_flags_shadow(fd);
+    if (on) {
+        flags |= bit;
+    } else {
+        flags &= ~bit;
+    }
+    twz_error err = twz_rt_fd_set_config(fd, IO_REGISTER_SOCKET_FLAGS, &flags, sizeof(flags));
+    if (err != SUCCESS) {
+        return twz_error_errno(err);
+    }
+    socket_flags_shadow_store(fd, flags);
+    return 0;
+}
+
+static int socket_flag_get(int fd, uint32_t bit, void *buffer, socklen_t *size) {
+    if (!buffer || !size || *size < sizeof(int)) return EINVAL;
+    *(int *)buffer = (socket_flags_shadow(fd) & bit) ? 1 : 0;
+    *size = sizeof(int);
+    return 0;
+}
+
+// A timeout register the runtime does not implement for sockets yet. Reporting ENOPROTOOPT is
+// the accurate answer -- silently accepting would leave callers believing a blocking read will
+// time out when it never will.
+static int socket_set_timeout(int fd, uint32_t reg, const void *buffer, socklen_t size) {
+    if (size < sizeof(struct timeval)) return EINVAL;
+    const struct timeval *tv = (const struct timeval *)buffer;
+    struct option_duration dur = {
+        .dur = {.seconds = (uint64_t)tv->tv_sec, .nanos = (uint32_t)(tv->tv_usec * 1000)},
+        .is_some = 1
+    };
+    twz_error err = twz_rt_fd_set_config(fd, reg, &dur, sizeof(dur));
+    if (err != SUCCESS) {
+        SYSTRACE("sys_setsockopt: timeout register %u unsupported by the runtime", reg);
+        return ENOPROTOOPT;
+    }
+    return 0;
+}
+
 int sys_setsockopt(int fd, int layer, int number, const void *buffer, socklen_t size) {
     SYSTRACE("sys_setsockopt(fd=%d, layer=%d, number=%d, buffer=%p, size=%d)", fd, layer, number, buffer, size);
-    
+
     if (!buffer) return EFAULT;
-    
-    // Map POSIX socket options to Twizzler register values
+
+    // Only IO_REGISTER_SOCKET_FLAGS is implemented for sockets in the runtime, so options map
+    // either onto a flag bit, onto nothing (accepted below), or onto ENOPROTOOPT.
     if (layer == SOL_SOCKET) {
         switch(number) {
-            case SO_RCVTIMEO: {
-                struct timeval *tv = (struct timeval *)buffer;
-                if (size < sizeof(struct timeval)) return EINVAL;
-                struct option_duration dur = {
-                    .dur = {.seconds = (uint64_t)tv->tv_sec, .nanos = (uint32_t)(tv->tv_usec * 1000)},
-                    .is_some = 1
-                };
-                twz_error err = twz_rt_fd_set_config(fd, IO_REGISTER_READTIMEOUT, &dur, sizeof(dur));
-                int result = twz_error_errno(err);
-                SYSTRACE("sys_setsockopt returning %d", result);
-                return result;
-            }
-            case SO_SNDTIMEO: {
-                struct timeval *tv = (struct timeval *)buffer;
-                if (size < sizeof(struct timeval)) return EINVAL;
-                struct option_duration dur = {
-                    .dur = {.seconds = (uint64_t)tv->tv_sec, .nanos = (uint32_t)(tv->tv_usec * 1000)},
-                    .is_some = 1
-                };
-                twz_error err = twz_rt_fd_set_config(fd, IO_REGISTER_WRITETIMEOUT, &dur, sizeof(dur));
-                int result = twz_error_errno(err);
-                SYSTRACE("sys_setsockopt returning %d", result);
-                return result;
-            }
+            case SO_RCVTIMEO:
+                return socket_set_timeout(fd, IO_REGISTER_READTIMEOUT, buffer, size);
+            case SO_SNDTIMEO:
+                return socket_set_timeout(fd, IO_REGISTER_WRITETIMEOUT, buffer, size);
+            case SO_BROADCAST:
+                if (size < sizeof(int)) return EINVAL;
+                return socket_flag_set(fd, SOCKET_FLAGS_BROADCAST, *(const int *)buffer != 0);
+            // Accepted without effect: ignoring these changes performance or address-reuse
+            // policy, not the observable correctness of a connection, and rejecting them
+            // makes ordinary server code fail at startup.
+            case SO_REUSEADDR:
+            case SO_REUSEPORT:
+            case SO_KEEPALIVE:
+            case SO_SNDBUF:
+            case SO_RCVBUF:
+            case SO_LINGER:
+            case SO_DONTROUTE:
+                SYSTRACE("sys_setsockopt: accepting SOL_SOCKET option %d without effect", number);
+                return 0;
             default:
-                SYSTRACE("sys_setsockopt returning %d (unsupported option)", EINVAL);
-                return EINVAL;
+                SYSTRACE("sys_setsockopt returning ENOPROTOOPT (SOL_SOCKET option %d)", number);
+                return ENOPROTOOPT;
         }
     } else if (layer == IPPROTO_TCP) {
         switch(number) {
-            case TCP_NODELAY: {
-                int nodelay = *(int *)buffer;
-                uint32_t flags = nodelay ? SOCKET_FLAGS_NODELAY : 0;
-                twz_error err = twz_rt_fd_set_config(fd, IO_REGISTER_SOCKET_FLAGS, &flags, sizeof(flags));
-                int result = twz_error_errno(err);
-                SYSTRACE("sys_setsockopt returning %d", result);
-                return result;
-            }
+            case TCP_NODELAY:
+                if (size < sizeof(int)) return EINVAL;
+                return socket_flag_set(fd, SOCKET_FLAGS_NODELAY, *(const int *)buffer != 0);
+            case TCP_KEEPIDLE:
+            case TCP_KEEPINTVL:
+            case TCP_KEEPCNT:
+                return 0;
             default:
-                SYSTRACE("sys_setsockopt returning %d (unsupported TCP option)", EINVAL);
-                return EINVAL;
+                SYSTRACE("sys_setsockopt returning ENOPROTOOPT (TCP option %d)", number);
+                return ENOPROTOOPT;
+        }
+    } else if (layer == IPPROTO_IP) {
+        switch(number) {
+            case IP_MULTICAST_LOOP:
+                if (size < sizeof(int)) return EINVAL;
+                return socket_flag_set(fd, SOCKET_FLAGS_MULTICAST_LOOP_V4, *(const int *)buffer != 0);
+            default:
+                // IP_TTL, IP_MULTICAST_TTL and group membership have IO_REGISTER_* constants
+                // reserved but no runtime implementation.
+                SYSTRACE("sys_setsockopt returning ENOPROTOOPT (IP option %d)", number);
+                return ENOPROTOOPT;
+        }
+    } else if (layer == IPPROTO_IPV6) {
+        switch(number) {
+            case IPV6_V6ONLY:
+                if (size < sizeof(int)) return EINVAL;
+                return socket_flag_set(fd, SOCKET_FLAGS_ONLYV6, *(const int *)buffer != 0);
+            case IPV6_MULTICAST_LOOP:
+                if (size < sizeof(int)) return EINVAL;
+                return socket_flag_set(fd, SOCKET_FLAGS_MULTICAST_LOOP_V6, *(const int *)buffer != 0);
+            default:
+                SYSTRACE("sys_setsockopt returning ENOPROTOOPT (IPV6 option %d)", number);
+                return ENOPROTOOPT;
         }
     }
-    
-    SYSTRACE("sys_setsockopt returning %d (unsupported level)", EINVAL);
-    return EINVAL;
+
+    SYSTRACE("sys_setsockopt returning ENOPROTOOPT (unsupported level %d)", layer);
+    return ENOPROTOOPT;
 }
 
 int sys_sockname(int fd, struct sockaddr *addr_ptr, socklen_t max_addr_length,
@@ -1772,9 +2208,17 @@ int sys_shutdown(int sockfd, int how) {
     SYSTRACE("sys_shutdown(sockfd=%d, how=%d)", sockfd, how);
     
     if (how < SHUT_RD || how > SHUT_RDWR) return EINVAL;
-    
-    // Use FD_CMD_SHUTDOWN to shutdown read/write ends
-    uint32_t shutdown_flags = how;  // SHUT_RD=0, SHUT_WR=1, SHUT_RDWR=2
+
+    // FD_CMD_SHUTDOWN takes a bitmask: bit 0 is the read side, bit 1 the write side. POSIX
+    // SHUT_* are consecutive values starting at 0, so they must be translated -- passing `how`
+    // straight through made SHUT_RD a no-op request (rejected), SHUT_WR shut down the *read*
+    // side, and SHUT_RDWR shut down only the write side.
+    uint32_t shutdown_flags;
+    switch (how) {
+        case SHUT_RD:   shutdown_flags = 1; break;
+        case SHUT_WR:   shutdown_flags = 2; break;
+        default:        shutdown_flags = 3; break;  // SHUT_RDWR
+    }
     twz_error err = twz_rt_fd_cmd(sockfd, FD_CMD_SHUTDOWN, &shutdown_flags, NULL);
     
     int result = twz_error_errno(err);
@@ -1808,14 +2252,19 @@ int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_re
 	if(off == -1){
 		return errno;
 	}
-    size_t dirent_size = 32;
+	size_t dirent_size = offsetof(struct dirent, d_name);
+	// struct name_entry is ~350 bytes, so sizing this batch off the caller's buffer would put
+	// an order of magnitude more than max_size on the stack. Cap it and let the caller loop.
+	static const size_t max_batch = 16;
 	size_t nr_twz_entries = max_size / dirent_size;
-	if(nr_twz_entries <= 0)
+	if(nr_twz_entries > max_batch)
+		nr_twz_entries = max_batch;
+	if(nr_twz_entries == 0)
 		nr_twz_entries = 1;
 	SYSTRACE("sys_read_entries(handle=%d, buffer=%p, max_size=%ld, bytes_read=%p), off=%ld, nr_twz_entries=%ld",
 		handle, buffer, max_size, bytes_read, off, nr_twz_entries);
 
-	struct name_entry twznames[nr_twz_entries];
+	struct name_entry twznames[max_batch];
 	struct io_result res = twz_rt_fd_enumerate_names(handle, twznames, nr_twz_entries, off / sizeof(struct name_entry));
 	if(res.err != 0)
 		return twz_error_errno(res.err);
@@ -1883,7 +2332,13 @@ int sys_uname(struct utsname *buf) {
 	snprintf(buf->nodename, sizeof(buf->nodename), "twizzler");
 	snprintf(buf->release, sizeof(buf->release), "1.0");
 	snprintf(buf->version, sizeof(buf->version), "twizzler-runtime");
+#if defined(__aarch64__)
+	snprintf(buf->machine, sizeof(buf->machine), "aarch64");
+#elif defined(__x86_64__)
 	snprintf(buf->machine, sizeof(buf->machine), "x86_64");
+#else
+	snprintf(buf->machine, sizeof(buf->machine), "unknown");
+#endif
 
 	int result = 0;
 	SYSTRACE("sys_uname returning %d", result);
@@ -1941,40 +2396,193 @@ int sys_pwrite(int fd, const void *buf, size_t n, off_t off, ssize_t *bytes_writ
 
 int sys_getsockopt(int fd, int layer, int number, void *__restrict buffer, socklen_t *__restrict size) {
     SYSTRACE("sys_getsockopt(fd=%d, layer=%d, number=%d, buffer=%p, size=%p)", fd, layer, number, buffer, size);
-    if(layer != SOL_SOCKET) {
-        SYSTRACE("sys_getsockopt returning %d (unsupported level)", EINVAL);
-        return EINVAL;
+    if (!buffer || !size) return EFAULT;
+
+    if (layer == SOL_SOCKET) {
+        switch(number) {
+            case SO_ERROR:
+                // No pending-error register exists; a connected socket reports success.
+                if (*size < sizeof(int)) return EINVAL;
+                *(int *)buffer = 0;
+                *size = sizeof(int);
+                SYSTRACE("sys_getsockopt returning 0, SO_ERROR=0");
+                return 0;
+            case SO_TYPE:
+                if (*size < sizeof(int)) return EINVAL;
+                *(int *)buffer = socket_type_get(fd);
+                *size = sizeof(int);
+                SYSTRACE("sys_getsockopt returning 0, SO_TYPE=%d", *(int *)buffer);
+                return 0;
+            case SO_BROADCAST:
+                return socket_flag_get(fd, SOCKET_FLAGS_BROADCAST, buffer, size);
+            // Reported as off, matching the fact that setting them has no effect.
+            case SO_REUSEADDR:
+            case SO_REUSEPORT:
+            case SO_KEEPALIVE:
+            case SO_DONTROUTE:
+            case SO_OOBINLINE:
+            case SO_ACCEPTCONN:
+                if (*size < sizeof(int)) return EINVAL;
+                *(int *)buffer = 0;
+                *size = sizeof(int);
+                return 0;
+            default:
+                SYSTRACE("sys_getsockopt returning ENOPROTOOPT (SOL_SOCKET option %d)", number);
+                return ENOPROTOOPT;
+        }
+    } else if (layer == IPPROTO_TCP) {
+        switch(number) {
+            case TCP_NODELAY:
+                return socket_flag_get(fd, SOCKET_FLAGS_NODELAY, buffer, size);
+            default:
+                SYSTRACE("sys_getsockopt returning ENOPROTOOPT (TCP option %d)", number);
+                return ENOPROTOOPT;
+        }
+    } else if (layer == IPPROTO_IP) {
+        switch(number) {
+            case IP_MULTICAST_LOOP:
+                return socket_flag_get(fd, SOCKET_FLAGS_MULTICAST_LOOP_V4, buffer, size);
+            default:
+                SYSTRACE("sys_getsockopt returning ENOPROTOOPT (IP option %d)", number);
+                return ENOPROTOOPT;
+        }
+    } else if (layer == IPPROTO_IPV6) {
+        switch(number) {
+            case IPV6_V6ONLY:
+                return socket_flag_get(fd, SOCKET_FLAGS_ONLYV6, buffer, size);
+            case IPV6_MULTICAST_LOOP:
+                return socket_flag_get(fd, SOCKET_FLAGS_MULTICAST_LOOP_V6, buffer, size);
+            default:
+                SYSTRACE("sys_getsockopt returning ENOPROTOOPT (IPV6 option %d)", number);
+                return ENOPROTOOPT;
+        }
     }
-    switch(number) {
-        case SO_ERROR:
-            memset(buffer, 0, sizeof(int));
-            *size = sizeof(int);
-            SYSTRACE("sys_getsockopt returning 0, SO_ERROR=0");
-            return 0;
-        default:
-	        SYSTRACE("sys_getsockopt returning EINVAL");
-            return EINVAL;
-    }
-    return 0;
+
+    SYSTRACE("sys_getsockopt returning ENOPROTOOPT (unsupported level %d)", layer);
+    return ENOPROTOOPT;
 }
 
 int sys_sysconf(int num, long *ret) {
     SYSTRACE("sys_sysconf(num=%d, ret=%p)", num, ret);
+    if (!ret)
+        return EFAULT;
     struct system_info info = twz_rt_get_sysinfo();
 	switch(num) {
     	case _SC_NPROCESSORS_CONF:
-            *ret = info.available_parallelism;
-            break;
     	case _SC_NPROCESSORS_ONLN:
-    	    *ret = info.available_parallelism;
+            *ret = info.available_parallelism;
             break;
         case _SC_PAGESIZE:
             *ret = info.page_size;
             break;
+        // Limits. These mirror the values reported elsewhere in this file, so callers that
+        // size buffers from sysconf agree with what the rest of the libc enforces.
+        case _SC_OPEN_MAX:
+            *ret = 1024;                    // matches sys_getrlimit's RLIMIT_NOFILE
+            break;
+        case _SC_CLK_TCK:
+            *ret = TWZ_CLK_TCK;             // matches sys_times
+            break;
+        case _SC_THREAD_STACK_MIN:
+            *ret = 0x200000;                // matches sys_prepare_stack's default
+            break;
+        case _SC_ARG_MAX:
+            *ret = 2097152;
+            break;
+        case _SC_CHILD_MAX:
+        case _SC_THREAD_THREADS_MAX:
+        case _SC_STREAM_MAX:
+            *ret = -1;                      // indeterminate
+            break;
+        case _SC_HOST_NAME_MAX:
+            *ret = HOST_NAME_MAX;
+            break;
+        case _SC_LOGIN_NAME_MAX:
+            *ret = LOGIN_NAME_MAX;
+            break;
+        case _SC_TTY_NAME_MAX:
+            // No TTY_NAME_MAX is defined for this ABI; sys_ttyname reports "/dev/tty".
+            *ret = _POSIX_TTY_NAME_MAX;
+            break;
+        case _SC_SYMLOOP_MAX:
+            // Matches naming_core's MAX_SYMLINK_DEREF ceiling closely enough; no macro exists.
+            *ret = _POSIX_SYMLOOP_MAX;
+            break;
+        case _SC_LINE_MAX:
+            *ret = 2048;
+            break;
+        case _SC_IOV_MAX:
+            *ret = IOV_MAX;
+            break;
+        case _SC_NGROUPS_MAX:
+            *ret = 0;                       // sys_getgroups is unimplemented
+            break;
+        case _SC_ATEXIT_MAX:
+            *ret = 32;
+            break;
+        case _SC_GETPW_R_SIZE_MAX:
+        case _SC_GETGR_R_SIZE_MAX:
+            *ret = 1024;
+            break;
+        case _SC_THREAD_KEYS_MAX:
+            *ret = PTHREAD_KEYS_MAX;
+            break;
+        case _SC_THREAD_DESTRUCTOR_ITERATIONS:
+            *ret = PTHREAD_DESTRUCTOR_ITERATIONS;
+            break;
+        // Memory. There is no per-compartment memory accounting exposed, so report unknown
+        // rather than a fabricated size.
+        case _SC_PHYS_PAGES:
+        case _SC_AVPHYS_PAGES:
+            *ret = -1;
+            break;
+        // Option queries. Answer honestly: -1 means "not supported", and a positive value
+        // means supported. Getting these wrong makes callers take unsupported code paths.
+        case _SC_VERSION:
+        case _SC_2_VERSION:
+        case _SC_XOPEN_VERSION:
+            *ret = 200809L;
+            break;
+        case _SC_THREADS:
+        case _SC_THREAD_SAFE_FUNCTIONS:
+        case _SC_MONOTONIC_CLOCK:
+        case _SC_BARRIERS:
+        case _SC_SPIN_LOCKS:
+        case _SC_READER_WRITER_LOCKS:
+        case _SC_SEMAPHORES:
+        case _SC_FSYNC:
+        case _SC_MAPPED_FILES:
+        case _SC_MEMORY_PROTECTION:
+        case _SC_SPAWN:
+        case _SC_REGEXP:
+        case _SC_SHELL:
+        case _SC_ADVISORY_INFO:
+            *ret = 200809L;
+            break;
+        case _SC_JOB_CONTROL:
+        case _SC_SAVED_IDS:
+        case _SC_REALTIME_SIGNALS:
+        case _SC_TIMERS:
+        case _SC_ASYNCHRONOUS_IO:
+        case _SC_PRIORITIZED_IO:
+        case _SC_PRIORITY_SCHEDULING:
+        case _SC_THREAD_PRIORITY_SCHEDULING:
+        case _SC_MEMLOCK:
+        case _SC_MEMLOCK_RANGE:
+        case _SC_MESSAGE_PASSING:
+        case _SC_SHARED_MEMORY_OBJECTS:
+        case _SC_CPUTIME:
+        case _SC_THREAD_CPUTIME:
+        case _SC_TYPED_MEMORY_OBJECTS:
+        case _SC_STREAMS:
+            *ret = -1;
+            break;
 		default: {
+            SYSTRACE("sys_sysconf: unhandled name %d", num);
 			return EINVAL;
 		}
 	}
+	SYSTRACE("sys_sysconf returning 0 (%ld)", *ret);
 	return 0;
 }
 //
@@ -1994,7 +2602,27 @@ pid_t sys_gettid() {
 }
 
 int sys_sigaltstack(const stack_t *ss, stack_t *oss) {
-    *oss = *ss;
+    SYSTRACE("sys_sigaltstack(ss=%p, oss=%p)", ss, oss);
+    // Signals are not delivered yet, so this only has to record what was set and report it
+    // back. Both arguments are independently optional: sigaltstack(NULL, &old) queries and
+    // sigaltstack(&new, NULL) sets.
+    // Not per-thread, unlike POSIX -- irrelevant until signal delivery exists.
+    static stack_t current = { .ss_sp = nullptr, .ss_flags = SS_DISABLE, .ss_size = 0 };
+
+    if (ss && (ss->ss_flags & ~(SS_DISABLE | SS_ONSTACK))) {
+        SYSTRACE("sys_sigaltstack returning EINVAL (bad ss_flags %d)", ss->ss_flags);
+        return EINVAL;
+    }
+    if (ss && !(ss->ss_flags & SS_DISABLE) && ss->ss_size < MINSIGSTKSZ) {
+        SYSTRACE("sys_sigaltstack returning ENOMEM (ss_size %ld)", ss->ss_size);
+        return ENOMEM;
+    }
+    if (oss) {
+        *oss = current;
+    }
+    if (ss) {
+        current = *ss;
+    }
 	return 0;
 }
 
@@ -2086,7 +2714,9 @@ int sys_futex_wait(int *pointer, int expected, const struct timespec *time) {
 }
 
 int sys_futex_wake(int *pointer) {
-	int e = twz_rt_futex_wake((_Atomic futex_word *)pointer, INT_MAX);
+	// twz_error is 64-bit with the category at bits 32-47 (ERROR_CATEGORY_SHIFT), so it must not
+	// be narrowed to int before twz_error_errno() reads the category out of it.
+	twz_error e = twz_rt_futex_wake((_Atomic futex_word *)pointer, FUTEX_WAKE_ALL);
 	return twz_error_errno(e);
 }
 
@@ -2123,19 +2753,7 @@ int sys_mkfifoat(int dirfd, const char *path, mode_t mode) {
 	return result;
 }
 
-int sys_symlink(const char *target_path, const char *link_path) {
-    SYSTRACE("sys_symlink(target_path=%s, link_path=%s)", target_path, link_path);
-	int result = ENOSYS;
-	SYSTRACE("sys_symlink returning %d", result);
-	return result;
-}
-
-int sys_symlinkat(const char *target_path, int dirfd, const char *link_path) {
-    SYSTRACE("sys_symlinkat(target_path=%s, dirfd=%d, link_path=%s)", target_path, dirfd, link_path);
-	int result = ENOSYS;
-	SYSTRACE("sys_symlinkat returning %d", result);
-	return result;
-}
+// sys_symlink and sys_symlinkat are implemented further down, with the other namespace ops.
 
 int sys_umask(mode_t mode, mode_t *old) {
     SYSTRACE("sys_umask(mode=%o, old=%p)", mode, old);
@@ -2160,17 +2778,13 @@ int sys_fchdir(int fd) {
 
 int sys_rename(const char *old_path, const char *new_path) {
     SYSTRACE("sys_rename(old_path=%s, new_path=%s)", old_path, new_path);
-	int result = twz_rt_fd_rename(old_path, strlen(old_path), new_path, strlen(new_path));
+	twz_error err = twz_rt_fd_rename(old_path, strlen(old_path), new_path, strlen(new_path));
+	int result = twz_error_errno(err);
 	SYSTRACE("sys_rename returning %d", result);
 	return result;
 }
 
-int sys_renameat(int old_dirfd, const char *old_path, int new_dirfd, const char *new_path) {
-    SYSTRACE("sys_renameat(old_dirfd=%d, old_path=%s, new_dirfd=%d, new_path=%s)", old_dirfd, old_path, new_dirfd, new_path);
-	int result = ENOSYS;
-	SYSTRACE("sys_renameat returning %d", result);
-	return result;
-}
+// sys_renameat is implemented further down, with the other namespace ops.
 
 int sys_rmdir(const char *path) {
     SYSTRACE("sys_rmdir(path=%s)", path);
@@ -2223,9 +2837,13 @@ int sys_setpgid(pid_t pid, pid_t pgid) {
 
 int sys_getsid(pid_t pid, pid_t *sid) {
     SYSTRACE("sys_getsid(pid=%d, sid=%p)", pid, sid);
-	int result = 1;
-	SYSTRACE("sys_getsid returning %d", result);
-	return result;
+    // There is a single session, matching the fixed getpid() of 1. Returning 1 here would
+    // mean EPERM and leave *sid untouched.
+    if (!sid)
+        return EFAULT;
+    *sid = 1;
+	SYSTRACE("sys_getsid returning 0 (sid=1)");
+	return 0;
 }
 
 int sys_setsid(pid_t *sid) {
@@ -2251,9 +2869,12 @@ int sys_setgid(gid_t gid) {
 
 int sys_getpgid(pid_t pid, pid_t *out) {
     SYSTRACE("sys_getpgid(pid=%d, out=%p)", pid, out);
-	int result = 1;
-	SYSTRACE("sys_getpgid returning %d", result);
-	return result;
+    // Single process group, as with sys_getsid.
+    if (!out)
+        return EFAULT;
+    *out = 1;
+	SYSTRACE("sys_getpgid returning 0 (pgid=1)");
+	return 0;
 }
 
 int sys_getgroups(size_t size, gid_t *list, int *retval) {
@@ -2274,6 +2895,12 @@ int sys_dup(int fd, int flags, int *newfd) {
 	twz_error err = twz_rt_fd_cmd(fd, FD_CMD_DUP, NULL, &dup_fd);
 	int result = twz_error_errno(err);
 	if (result == 0) {
+		// The duplicate refers to the same open file, so it inherits the recorded socket type
+		// and access mode. FD_CLOEXEC is not inherited by dup() unless dup3 asked for it.
+		fd_state_clear(dup_fd);
+		fd_openflags_set(dup_fd, fd_openflags_get(fd));
+		socket_prot_set(dup_fd, socket_type_get(fd));
+		fd_cloexec_set(dup_fd, (flags & O_CLOEXEC) != 0);
 		*newfd = dup_fd;
 	}
 	SYSTRACE("sys_dup returning %d", result);
@@ -2348,6 +2975,459 @@ int sys_getentropy(void *buffer, size_t length) {
     }
 
     SYSTRACE("sys_getentropy returning 0");
+    return 0;
+}
+
+} // namespace mlibc
+
+#include <sys/file.h>
+#include <sys/resource.h>
+#include <sys/statvfs.h>
+#include <sys/times.h>
+
+namespace mlibc {
+
+// ---------------------------------------------------------------------------
+// Namespace operations. The underlying twz_rt_fd_* calls resolve names from the
+// root, so only the AT_FDCWD forms of the *at() variants can be supported.
+// ---------------------------------------------------------------------------
+
+int sys_symlink(const char *target_path, const char *link_path) {
+    SYSTRACE("sys_symlink(target_path=%s, link_path=%s)", target_path, link_path);
+    if (!target_path || !link_path)
+        return EFAULT;
+    twz_error err = twz_rt_fd_symlink(link_path, strlen(link_path),
+        target_path, strlen(target_path));
+    int result = twz_error_errno(err);
+    SYSTRACE("sys_symlink returning %d", result);
+    return result;
+}
+
+int sys_symlinkat(const char *target_path, int dirfd, const char *link_path) {
+    SYSTRACE("sys_symlinkat(target_path=%s, dirfd=%d, link_path=%s)", target_path, dirfd, link_path);
+    if (dirfd != AT_FDCWD) {
+        SYSTRACE("sys_symlinkat: relative dirfd not supported");
+        return ENOSYS;
+    }
+    return sys_symlink(target_path, link_path);
+}
+
+int sys_readlinkat(int dirfd, const char *path, void *buffer, size_t max_size, ssize_t *length) {
+    SYSTRACE("sys_readlinkat(dirfd=%d, path=%s, buffer=%p, max_size=%ld, length=%p)",
+        dirfd, path, buffer, max_size, length);
+    if (dirfd != AT_FDCWD) {
+        SYSTRACE("sys_readlinkat: relative dirfd not supported");
+        return ENOSYS;
+    }
+    return sys_readlink(path, buffer, max_size, length);
+}
+
+int sys_renameat(int old_dirfd, const char *old_path, int new_dirfd, const char *new_path) {
+    SYSTRACE("sys_renameat(old_dirfd=%d, old_path=%s, new_dirfd=%d, new_path=%s)",
+        old_dirfd, old_path, new_dirfd, new_path);
+    if (old_dirfd != AT_FDCWD || new_dirfd != AT_FDCWD) {
+        SYSTRACE("sys_renameat: relative dirfd not supported");
+        return ENOSYS;
+    }
+    return sys_rename(old_path, new_path);
+}
+
+// ---------------------------------------------------------------------------
+// Memory advice and locking. Everything here is advisory, and objects are
+// already fully resident once mapped, so accepting these is accurate rather
+// than merely convenient. Reporting ENOSYS instead breaks callers (allocators,
+// CPython) that treat failure as fatal.
+// ---------------------------------------------------------------------------
+
+int sys_madvise(void *addr, size_t length, int advice) {
+    SYSTRACE("sys_madvise(addr=%p, length=%ld, advice=%d)", addr, length, advice);
+    return 0;
+}
+
+int sys_posix_madvise(void *addr, size_t length, int advice) {
+    SYSTRACE("sys_posix_madvise(addr=%p, length=%ld, advice=%d)", addr, length, advice);
+    return 0;
+}
+
+int sys_msync(void *addr, size_t length, int flags) {
+    SYSTRACE("sys_msync(addr=%p, length=%ld, flags=%d)", addr, length, flags);
+    // sys_vm_map only produces anonymous memory today, so there is nothing to write back.
+    return 0;
+}
+
+int sys_mlock(const void *addr, size_t length) {
+    SYSTRACE("sys_mlock(addr=%p, length=%ld)", addr, length);
+    return 0;
+}
+
+int sys_munlock(const void *addr, size_t length) {
+    SYSTRACE("sys_munlock(addr=%p, length=%ld)", addr, length);
+    return 0;
+}
+
+int sys_mlockall(int flags) {
+    SYSTRACE("sys_mlockall(flags=%d)", flags);
+    return 0;
+}
+
+int sys_munlockall(void) {
+    SYSTRACE("sys_munlockall()");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// File locking and allocation.
+// ---------------------------------------------------------------------------
+
+int sys_flock(int fd, int options) {
+    SYSTRACE("sys_flock(fd=%d, options=%d)", fd, options);
+    // No cross-compartment advisory locking exists yet. Validate the request so callers with
+    // bad arguments still see EINVAL, then accept it.
+    int op = options & ~LOCK_NB;
+    if (op != LOCK_SH && op != LOCK_EX && op != LOCK_UN) {
+        return EINVAL;
+    }
+    struct fd_info info;
+    if (!twz_rt_fd_get_info(fd, &info)) {
+        return EBADF;
+    }
+    return 0;
+}
+
+int sys_fallocate(int fd, off_t offset, size_t size) {
+    SYSTRACE("sys_fallocate(fd=%d, offset=%ld, size=%ld)", fd, offset, size);
+    if (offset < 0) {
+        return EINVAL;
+    }
+    struct fd_info info;
+    if (!twz_rt_fd_get_info(fd, &info)) {
+        return EBADF;
+    }
+    // Only growing the file is expressible via FD_CMD_TRUNCATE; allocation is implicit for
+    // object-backed files, so a range already within the file needs no work.
+    uint64_t end = (uint64_t)offset + size;
+    if (end <= info.len) {
+        return 0;
+    }
+    twz_error err = twz_rt_fd_cmd(fd, FD_CMD_TRUNCATE, &end, NULL);
+    int result = twz_error_errno(err);
+    SYSTRACE("sys_fallocate returning %d", result);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem statistics. There is no notion of a mounted filesystem with a
+// block budget, so the geometry fields are reported as unknown (0) rather than
+// invented.
+// ---------------------------------------------------------------------------
+
+static void fill_statvfs(struct statvfs *out) {
+    struct system_info si = twz_rt_get_sysinfo();
+    memset(out, 0, sizeof(*out));
+    out->f_bsize = si.page_size;
+    out->f_frsize = si.page_size;
+    out->f_namemax = NAME_MAX;
+}
+
+int sys_statvfs(const char *path, struct statvfs *out) {
+    SYSTRACE("sys_statvfs(path=%s, out=%p)", path, out);
+    if (!path || !out)
+        return EFAULT;
+    // Report per-path errors (e.g. ENOENT) the way a real statvfs would.
+    int fd = -1;
+    int e = sys_open(path, O_RDONLY, 0, &fd);
+    if (e != 0) {
+        SYSTRACE("sys_statvfs returning %d (open failed)", e);
+        return e;
+    }
+    twz_rt_fd_close(fd);
+    fill_statvfs(out);
+    SYSTRACE("sys_statvfs returning 0");
+    return 0;
+}
+
+int sys_fstatvfs(int fd, struct statvfs *out) {
+    SYSTRACE("sys_fstatvfs(fd=%d, out=%p)", fd, out);
+    if (!out)
+        return EFAULT;
+    struct fd_info info;
+    if (!twz_rt_fd_get_info(fd, &info)) {
+        return EBADF;
+    }
+    fill_statvfs(out);
+    SYSTRACE("sys_fstatvfs returning 0");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Resource usage. The runtime exposes no per-process or per-thread CPU
+// accounting, so elapsed wall time stands in for user time and the remaining
+// counters are zero. This is approximate but lets callers that require the call
+// to succeed (shell `times`, CPython's resource module) run.
+// ---------------------------------------------------------------------------
+
+int sys_getrusage(int scope, struct rusage *usage) {
+    SYSTRACE("sys_getrusage(scope=%d, usage=%p)", scope, usage);
+    if (!usage)
+        return EFAULT;
+    if (scope != RUSAGE_SELF && scope != RUSAGE_CHILDREN) {
+        return EINVAL;
+    }
+    memset(usage, 0, sizeof(*usage));
+    if (scope == RUSAGE_SELF) {
+        struct duration up = twz_rt_get_monotonic_time();
+        usage->ru_utime.tv_sec = (time_t)up.seconds;
+        usage->ru_utime.tv_usec = (suseconds_t)(up.nanos / 1000);
+    }
+    SYSTRACE("sys_getrusage returning 0");
+    return 0;
+}
+
+int sys_times(struct tms *tms, clock_t *out) {
+    SYSTRACE("sys_times(tms=%p, out=%p)", tms, out);
+    if (!tms || !out)
+        return EFAULT;
+    struct duration up = twz_rt_get_monotonic_time();
+    clock_t ticks = (clock_t)(up.seconds * TWZ_CLK_TCK
+        + up.nanos / (1000000000ul / TWZ_CLK_TCK));
+    memset(tms, 0, sizeof(*tms));
+    tms->tms_utime = ticks;
+    *out = ticks;
+    SYSTRACE("sys_times returning 0 (ticks=%ld)", (long)ticks);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Process attributes that have a single fixed value in this environment.
+// ---------------------------------------------------------------------------
+
+int sys_setrlimit(int resource, const struct rlimit *limit) {
+    SYSTRACE("sys_setrlimit(resource=%d, limit=%p)", resource, limit);
+    if (!limit)
+        return EFAULT;
+    // Accepted and ignored, to match the fixed values sys_getrlimit reports.
+    return 0;
+}
+
+static char hostname_buf[HOST_NAME_MAX + 1] = "twizzler";
+
+int sys_sethostname(const char *buffer, size_t bufsize) {
+    SYSTRACE("sys_sethostname(buffer=%p, bufsize=%ld)", buffer, bufsize);
+    if (!buffer)
+        return EFAULT;
+    if (bufsize > HOST_NAME_MAX)
+        return EINVAL;
+    memcpy(hostname_buf, buffer, bufsize);
+    hostname_buf[bufsize] = '\0';
+    SYSTRACE("sys_sethostname returning 0 (%s)", hostname_buf);
+    return 0;
+}
+
+int sys_getloadavg(double *samples) {
+    SYSTRACE("sys_getloadavg(samples=%p)", samples);
+    if (!samples)
+        return EFAULT;
+    // No load accounting exists.
+    samples[0] = 0.0;
+    samples[1] = 0.0;
+    samples[2] = 0.0;
+    return 0;
+}
+
+int sys_nice(int nice, int *new_nice) {
+    SYSTRACE("sys_nice(nice=%d, new_nice=%p)", nice, new_nice);
+    // Priorities are not adjustable from userspace yet; report an unchanged niceness.
+    if (new_nice)
+        *new_nice = 0;
+    return 0;
+}
+
+int sys_sockatmark(int sockfd, int *out) {
+    SYSTRACE("sys_sockatmark(sockfd=%d, out=%p)", sockfd, out);
+    if (!out)
+        return EFAULT;
+    struct fd_info info;
+    if (!twz_rt_fd_get_info(sockfd, &info)) {
+        return EBADF;
+    }
+    if (info.kind != FdKind_Socket) {
+        return ENOTSOCK;
+    }
+    // Out-of-band data is not supported, so the mark is never reached.
+    *out = 0;
+    return 0;
+}
+
+int sys_clock_set(int clock, time_t secs, long nanos) {
+    SYSTRACE("sys_clock_set(clock=%d, secs=%ld, nanos=%ld)", clock, secs, nanos);
+    // The system clock is not settable from a compartment.
+    return EPERM;
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling parameters. The scheduler is not controllable through the runtime
+// ABI, so these describe a single fixed policy rather than failing: pthread and
+// CPython both query them during startup.
+// ---------------------------------------------------------------------------
+
+int sys_get_min_priority(int policy, int *out) {
+    SYSTRACE("sys_get_min_priority(policy=%d, out=%p)", policy, out);
+    if (!out)
+        return EFAULT;
+    if (policy != SCHED_OTHER && policy != SCHED_FIFO && policy != SCHED_RR)
+        return EINVAL;
+    *out = 0;
+    return 0;
+}
+
+int sys_get_max_priority(int policy, int *out) {
+    SYSTRACE("sys_get_max_priority(policy=%d, out=%p)", policy, out);
+    if (!out)
+        return EFAULT;
+    if (policy != SCHED_OTHER && policy != SCHED_FIFO && policy != SCHED_RR)
+        return EINVAL;
+    *out = 0;
+    return 0;
+}
+
+int sys_getscheduler(pid_t pid, int *policy) {
+    SYSTRACE("sys_getscheduler(pid=%d, policy=%p)", pid, policy);
+    if (!policy)
+        return EFAULT;
+    *policy = SCHED_OTHER;
+    return 0;
+}
+
+int sys_getparam(pid_t pid, struct sched_param *param) {
+    SYSTRACE("sys_getparam(pid=%d, param=%p)", pid, param);
+    if (!param)
+        return EFAULT;
+    param->sched_priority = 0;
+    return 0;
+}
+
+int sys_setparam(pid_t pid, const struct sched_param *param) {
+    SYSTRACE("sys_setparam(pid=%d, param=%p)", pid, param);
+    if (!param)
+        return EFAULT;
+    if (param->sched_priority != 0)
+        return EINVAL;
+    return 0;
+}
+
+int sys_getschedparam(void *tcb, int *policy, struct sched_param *param) {
+    SYSTRACE("sys_getschedparam(tcb=%p, policy=%p, param=%p)", tcb, policy, param);
+    if (!policy || !param)
+        return EFAULT;
+    *policy = SCHED_OTHER;
+    param->sched_priority = 0;
+    return 0;
+}
+
+int sys_setschedparam(void *tcb, int policy, const struct sched_param *param) {
+    SYSTRACE("sys_setschedparam(tcb=%p, policy=%d, param=%p)", tcb, policy, param);
+    if (!param)
+        return EFAULT;
+    if (policy != SCHED_OTHER)
+        return EINVAL;
+    if (param->sched_priority != 0)
+        return EINVAL;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// CPU affinity. Threads are not pinnable through the runtime ABI, so queries
+// report every CPU as eligible and requests are accepted without effect.
+// ---------------------------------------------------------------------------
+
+static int fill_all_cpus(size_t cpusetsize, cpu_set_t *mask) {
+    if (!mask)
+        return EFAULT;
+    if (cpusetsize < sizeof(__cpu_mask) || (cpusetsize % sizeof(__cpu_mask)) != 0)
+        return EINVAL;
+
+    struct system_info si = twz_rt_get_sysinfo();
+    size_t ncpus = si.available_parallelism ? si.available_parallelism : 1;
+    size_t setbits = cpusetsize * 8;
+    if (ncpus > setbits)
+        ncpus = setbits;
+
+    memset(mask, 0, cpusetsize);
+    __cpu_mask *bits = mask->__bits;
+    for (size_t i = 0; i < ncpus; i++) {
+        bits[i / __NCPUBITS] |= (__cpu_mask)1 << (i % __NCPUBITS);
+    }
+    return 0;
+}
+
+int sys_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask) {
+    SYSTRACE("sys_getaffinity(pid=%d, cpusetsize=%ld, mask=%p)", pid, cpusetsize, mask);
+    return fill_all_cpus(cpusetsize, mask);
+}
+
+int sys_getthreadaffinity(pid_t tid, size_t cpusetsize, cpu_set_t *mask) {
+    SYSTRACE("sys_getthreadaffinity(tid=%d, cpusetsize=%ld, mask=%p)", tid, cpusetsize, mask);
+    return fill_all_cpus(cpusetsize, mask);
+}
+
+int sys_setaffinity(pid_t pid, size_t cpusetsize, const cpu_set_t *mask) {
+    SYSTRACE("sys_setaffinity(pid=%d, cpusetsize=%ld, mask=%p)", pid, cpusetsize, mask);
+    if (!mask)
+        return EFAULT;
+    return 0;
+}
+
+int sys_setthreadaffinity(pid_t tid, size_t cpusetsize, const cpu_set_t *mask) {
+    SYSTRACE("sys_setthreadaffinity(tid=%d, cpusetsize=%ld, mask=%p)", tid, cpusetsize, mask);
+    if (!mask)
+        return EFAULT;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Network interfaces and terminal names.
+// ---------------------------------------------------------------------------
+
+int sys_if_nametoindex(const char *name, unsigned int *ret) {
+    SYSTRACE("sys_if_nametoindex(name=%s, ret=%p)", name, ret);
+    if (!name || !ret)
+        return EFAULT;
+    // The stack exposes no enumerable interfaces; only loopback is nameable.
+    if (!strcmp(name, "lo")) {
+        *ret = 1;
+        return 0;
+    }
+    return ENODEV;
+}
+
+int sys_if_indextoname(unsigned int index, char *name) {
+    SYSTRACE("sys_if_indextoname(index=%u, name=%p)", index, name);
+    if (!name)
+        return EFAULT;
+    if (index != 1)
+        return ENXIO;
+    strcpy(name, "lo");
+    return 0;
+}
+
+int sys_ttyname(int fd, char *buf, size_t size) {
+    SYSTRACE("sys_ttyname(fd=%d, buf=%p, size=%ld)", fd, buf, size);
+    if (!buf)
+        return EFAULT;
+    struct fd_info info;
+    if (!twz_rt_fd_get_info(fd, &info)) {
+        return EBADF;
+    }
+    if (!(info.flags & FD_IS_TERMINAL)) {
+        return ENOTTY;
+    }
+    // Terminals are not reachable by name, so report the conventional alias.
+    static const char name[] = "/dev/tty";
+    if (size < sizeof(name)) {
+        return ERANGE;
+    }
+    memcpy(buf, name, sizeof(name));
+    SYSTRACE("sys_ttyname returning 0");
     return 0;
 }
 

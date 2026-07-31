@@ -67,6 +67,7 @@ enum open_kind {
   OpenKind_PtyServer,
   OpenKind_PtyClient,
   OpenKind_Compartment,
+  OpenKind_Kqueue,
 };
 
 enum addr_kind {
@@ -163,6 +164,12 @@ const fd_cmd FD_CMD_SYNC = 1;
 const fd_cmd FD_CMD_TRUNCATE = 2;
 /// Close either the read or write end of a file descriptor. The arg points to a u32, the first bit of which indicates read-side, the second indicates write.
 const fd_cmd FD_CMD_SHUTDOWN = 3;
+/// Duplicate this descriptor onto a caller-chosen descriptor, closing whatever that descriptor
+/// referred to. The arg argument points to the target descriptor. Unlike FD_CMD_DUP, which returns
+/// the lowest free descriptor, this lets a caller place a duplicate at a specific number (needed
+/// for dup2 and fcntl's F_DUPFD). Duplicating a descriptor onto itself succeeds and does nothing.
+/// The ret argument points to a descriptor, set to the target on success.
+const fd_cmd FD_CMD_DUP2 = 4;
 
 /// Perform a command on the descriptor. The arguments arg and ret are interpreted according to
 /// the command specified.

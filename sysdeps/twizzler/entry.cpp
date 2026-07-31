@@ -19,6 +19,10 @@ extern "C" void __mlibc_entry(uintptr_t arg, int (*main_fn)(int argc, char *argv
 __attribute__((weak))
 extern "C" void __mlibc_entry_from_rust(uintptr_t *entry_stack, int (*main_fn)(int argc, char *argv[], char *env[])) {
 	entryStack = entry_stack;
+	// Safe only because the runtime appends an AT_NULL-terminated aux vector to the entry stack
+	// (twizzler_rt_abi::core::auxv, used by both the reference and minimal runtimes):
+	// peekauxval() walks past the envp terminator and reads pairs until AT_NULL, with no length
+	// to bound it. The runtime reports AT_HWCAP as 0, so baseline code paths are selected.
 	__hwcap = getauxval(AT_HWCAP);
 	if(main_fn != nullptr) {
     	auto result = main_fn(mlibc::entry_stack.argc, mlibc::entry_stack.argv, environ);

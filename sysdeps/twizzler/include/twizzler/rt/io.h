@@ -95,6 +95,48 @@ extern twz_error twz_rt_fd_waitpoint(descriptor fd, wait_kind ek, uint64_t **poi
 extern struct io_result twz_rt_fd_select(size_t nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct option_duration timeout);
 extern struct io_result twz_rt_fd_poll(struct pollfd *fds, size_t nfds, struct option_duration timeout);
 
+/// Filter kinds for a kevent registration. There is no underlying support for anything other than
+/// readable/writable readiness (unlike BSD kqueue, there is no vnode/proc/signal/timer filter support).
+typedef int16_t kevent_filter;
+const kevent_filter EVFILT_READ = 1;
+const kevent_filter EVFILT_WRITE = 2;
+
+/// Flags for a kevent changelist/eventlist entry.
+typedef uint16_t kevent_flags;
+/// Add (or update) this registration.
+const kevent_flags EV_ADD = 1;
+/// Remove this registration.
+const kevent_flags EV_DELETE = 2;
+/// Enable a previously-disabled registration.
+const kevent_flags EV_ENABLE = 4;
+/// Disable this registration without removing it.
+const kevent_flags EV_DISABLE = 8;
+/// Remove this registration after it fires once.
+const kevent_flags EV_ONESHOT = 0x10;
+/// Set on an eventlist entry to indicate that applying the corresponding changelist entry failed;
+/// `data` holds the error code. Note: edge-triggered notification (EV_CLEAR) is not supported --
+/// all filters are level-triggered, matching twz_rt_fd_poll/twz_rt_fd_select.
+const kevent_flags EV_ERROR = 0x20;
+
+struct kevent {
+  /// The identity being registered on -- currently always a descriptor.
+  uintptr_t ident;
+  kevent_filter filter;
+  kevent_flags flags;
+  uint32_t fflags;
+  intptr_t data;
+  void *udata;
+};
+
+/// Create a kqueue file descriptor via twz_rt_fd_open(OpenKind_Kqueue, flags, NULL, 0).
+///
+/// Apply the nchanges entries in changelist to kq's persistent registration set (see EV_ADD /
+/// EV_DELETE / EV_ENABLE / EV_DISABLE / EV_ONESHOT above), then wait for up to nevents currently
+/// enabled registrations to become ready (or for timeout to expire), writing them into eventlist.
+/// Returns the number of entries written into eventlist, which may include EV_ERROR entries
+/// reporting invalid changelist entries.
+extern struct io_result twz_rt_fd_kevent(descriptor kq, const struct kevent *changelist, size_t nchanges, struct kevent *eventlist, size_t nevents, struct option_duration timeout);
+
 /// Get a config value for register reg.
 extern twz_error twz_rt_fd_get_config(descriptor fd, uint32_t reg, void *val, size_t len);
 /// Set a config value for register reg. Setting a register may have side effects.
