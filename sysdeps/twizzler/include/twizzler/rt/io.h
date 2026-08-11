@@ -95,37 +95,61 @@ extern twz_error twz_rt_fd_waitpoint(descriptor fd, wait_kind ek, uint64_t **poi
 extern struct io_result twz_rt_fd_select(size_t nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct option_duration timeout);
 extern struct io_result twz_rt_fd_poll(struct pollfd *fds, size_t nfds, struct option_duration timeout);
 
-/// Filter kinds for a kevent registration. There is no underlying support for anything other than
-/// readable/writable readiness (unlike BSD kqueue, there is no vnode/proc/signal/timer filter support).
+/// Filter kinds for a kevent registration. Values, flags, and the struct layout below all match
+/// the BSD/libc kqueue ABI, so libc's kevent() is a straight pass-through to twz_rt_fd_kevent with
+/// no translation. Only readable/writable readiness and userspace-triggered notification are
+/// supported -- unlike BSD kqueue there is no vnode/proc/signal/timer filter. Any future filter
+/// should take its BSD value.
 typedef int16_t kevent_filter;
-const kevent_filter EVFILT_READ = 1;
-const kevent_filter EVFILT_WRITE = 2;
+const kevent_filter EVFILT_READ = -1;
+const kevent_filter EVFILT_WRITE = -2;
+/// Userspace-triggered notification. `ident` is any caller-chosen value -- it is NOT a descriptor.
+/// The registration fires when a later changelist entry for the same (ident, EVFILT_USER) sets
+/// NOTE_TRIGGER in fflags. Unlike the readiness filters, EVFILT_USER is always clear-on-report: a
+/// trigger is consumed when reported, so one NOTE_TRIGGER yields exactly one event.
+const kevent_filter EVFILT_USER = -11;
+
+/// fflags bit on an EVFILT_USER changelist entry: fire that registration. The BSD NOTE_FF*
+/// fflags-arithmetic operators are not supported; an EVFILT_USER registration's fflags is stored at
+/// EV_ADD time and reported back unmodified.
+const uint32_t NOTE_TRIGGER = 0x01000000;
 
 /// Flags for a kevent changelist/eventlist entry.
 typedef uint16_t kevent_flags;
 /// Add (or update) this registration.
-const kevent_flags EV_ADD = 1;
+const kevent_flags EV_ADD = 0x0001;
 /// Remove this registration.
-const kevent_flags EV_DELETE = 2;
+const kevent_flags EV_DELETE = 0x0002;
 /// Enable a previously-disabled registration.
-const kevent_flags EV_ENABLE = 4;
+const kevent_flags EV_ENABLE = 0x0004;
 /// Disable this registration without removing it.
-const kevent_flags EV_DISABLE = 8;
+const kevent_flags EV_DISABLE = 0x0008;
 /// Remove this registration after it fires once.
-const kevent_flags EV_ONESHOT = 0x10;
-/// Set on an eventlist entry to indicate that applying the corresponding changelist entry failed;
-/// `data` holds the error code. Note: edge-triggered notification (EV_CLEAR) is not supported --
-/// all filters are level-triggered, matching twz_rt_fd_poll/twz_rt_fd_select.
-const kevent_flags EV_ERROR = 0x20;
+const kevent_flags EV_ONESHOT = 0x0010;
+/// Accepted and ignored. The readiness filters are always level-triggered, matching twz_rt_fd_poll
+/// / twz_rt_fd_select; there is no edge-triggered mode. (EVFILT_USER is always clear-on-report
+/// regardless of this flag.)
+const kevent_flags EV_CLEAR = 0x0020;
+/// Always emit an eventlist receipt for this changelist entry, even when it applied cleanly (see
+/// EV_ERROR). Sizing eventlist to nchanges therefore fills it with receipts, which is what lets a
+/// pure-registration call return without waiting.
+const kevent_flags EV_RECEIPT = 0x0040;
+/// Set on an eventlist entry that is a receipt for a changelist entry rather than a readiness
+/// event. `data` holds an errno describing why the change failed, or 0 if it applied cleanly (only
+/// possible when the change asked for EV_RECEIPT). Failed changes always produce one of these.
+const kevent_flags EV_ERROR = 0x4000;
 
 struct kevent {
-  /// The identity being registered on -- currently always a descriptor.
+  /// The identity being registered on: a descriptor for EVFILT_READ/EVFILT_WRITE, or an arbitrary
+  /// caller-chosen value for EVFILT_USER.
   uintptr_t ident;
   kevent_filter filter;
   kevent_flags flags;
   uint32_t fflags;
   intptr_t data;
   void *udata;
+  /// Unused. Present so this matches the BSD/libc `struct kevent` layout (64 bytes) exactly.
+  uint64_t ext[4];
 };
 
 /// Create a kqueue file descriptor via twz_rt_fd_open(OpenKind_Kqueue, flags, NULL, 0).
@@ -133,8 +157,10 @@ struct kevent {
 /// Apply the nchanges entries in changelist to kq's persistent registration set (see EV_ADD /
 /// EV_DELETE / EV_ENABLE / EV_DISABLE / EV_ONESHOT above), then wait for up to nevents currently
 /// enabled registrations to become ready (or for timeout to expire), writing them into eventlist.
-/// Returns the number of entries written into eventlist, which may include EV_ERROR entries
-/// reporting invalid changelist entries.
+/// Returns the number of entries written into eventlist, which may include EV_ERROR receipts
+/// describing changelist entries. Receipts are written first, and once eventlist is full the call
+/// returns without waiting -- so a caller that sets EV_RECEIPT on every change and sizes eventlist
+/// to nchanges gets a non-blocking apply-only call.
 extern struct io_result twz_rt_fd_kevent(descriptor kq, const struct kevent *changelist, size_t nchanges, struct kevent *eventlist, size_t nevents, struct option_duration timeout);
 
 /// Get a config value for register reg.
