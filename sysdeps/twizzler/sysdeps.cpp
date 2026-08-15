@@ -1015,15 +1015,226 @@ int sys_fstatfs(int fd, struct statfs *buf) {
 extern "C" void __mlibc_signal_restore(void);
 extern "C" void __mlibc_signal_restore_rt(void);
 
+// Signal support.
+//
+// Twizzler keeps no in-kernel disposition table. The monitor posts a signal to a compartment, the
+// kernel turns it into a Mailbox upcall on the target thread, and the reference runtime's default
+// upcall handler calls __mlibc_handle_signal() below. That upcall interrupts whatever the thread
+// was doing, so nothing on the delivery path may take a lock: a thread interrupted inside
+// sigaction() would deadlock against itself. The table is read lock-free instead -- writers
+// publish the handler pointer with a release store *after* the flags and mask it selects, and the
+// dispatcher acquire-loads it.
+//
+// _NSIG is 65, so every signal fits in sigset_t::__sig[0] and masks are single-word atomics.
+
+// Return values for __mlibc_handle_signal(). Mirrored in the reference runtime's upcall handler
+// (src/rt/reference/src/runtime/upcall.rs) -- keep the two in sync.
+#define MLIBC_SIGNAL_DEFAULT 0
+#define MLIBC_SIGNAL_HANDLED 1
+#define MLIBC_SIGNAL_IGNORED 2
+
+namespace {
+
+struct SigDisposition {
+	uintptr_t handler; // SIG_DFL, SIG_IGN, or a function pointer. Published last.
+	unsigned long flags;
+	unsigned long mask;
+};
+
+SigDisposition sigDispositions[NSIG];
+unsigned long sigBlocked;
+unsigned long sigPending;
+// Bumped once per delivery so pause()/sigsuspend() can tell that something arrived.
+futex_word sigDeliveries;
+
+constexpr unsigned long sigBit(int sig) {
+	return 1UL << (sig - 1);
+}
+
+bool sigValid(int sig) {
+	return sig > 0 && sig < NSIG;
+}
+
+unsigned long sigMaskOf(const sigset_t *set) {
+	return set ? set->__sig[0] : 0;
+}
+
+void sigSetMask(sigset_t *set, unsigned long mask) {
+	memset(set, 0, sizeof(*set));
+	set->__sig[0] = mask;
+}
+
+// Defined by the reference runtime (src/rt/reference/src/runtime/upcall.rs), which owns the single
+// table of what an unhandled signal does -- keeping it there means the upcall path and the
+// raise-against-self path below cannot drift apart. Weak, because a runtime that predates it (or
+// the minimal runtime, which has no upcall handling) still has to leave us something sane.
+extern "C" __attribute__((weak)) void __twz_rt_default_signal_action(int sig);
+
+void sigDefaultAction(int sig) {
+	if(__twz_rt_default_signal_action) {
+		__twz_rt_default_signal_action(sig);
+		return;
+	}
+	twz_rt_exit(128 + sig);
+}
+
+// Runs the installed disposition for sig. Deliberately does not chain to pending signals; callers
+// do that once at top level so recursion depth stays bounded.
+int sigDeliver(int sig) {
+	if(!sigValid(sig))
+		return MLIBC_SIGNAL_DEFAULT;
+
+	unsigned long bit = sigBit(sig);
+	if(__atomic_load_n(&sigBlocked, __ATOMIC_ACQUIRE) & bit) {
+		__atomic_fetch_or(&sigPending, bit, __ATOMIC_ACQ_REL);
+		return MLIBC_SIGNAL_HANDLED;
+	}
+
+	SigDisposition *disp = &sigDispositions[sig];
+	uintptr_t handler = __atomic_load_n(&disp->handler, __ATOMIC_ACQUIRE);
+	if(handler == reinterpret_cast<uintptr_t>(SIG_DFL))
+		return MLIBC_SIGNAL_DEFAULT;
+	if(handler == reinterpret_cast<uintptr_t>(SIG_IGN))
+		return MLIBC_SIGNAL_IGNORED;
+
+	unsigned long flags = disp->flags;
+	unsigned long blockDuringHandler = disp->mask;
+	if(!(flags & SA_NODEFER))
+		blockDuringHandler |= bit;
+	if(flags & SA_RESETHAND)
+		__atomic_store_n(&disp->handler, reinterpret_cast<uintptr_t>(SIG_DFL), __ATOMIC_RELEASE);
+
+	unsigned long saved = __atomic_fetch_or(&sigBlocked, blockDuringHandler, __ATOMIC_ACQ_REL);
+	if(flags & SA_SIGINFO) {
+		siginfo_t info;
+		memset(&info, 0, sizeof(info));
+		info.si_signo = sig;
+		info.si_code = SI_USER;
+		reinterpret_cast<void (*)(int, siginfo_t *, void *)>(handler)(sig, &info, nullptr);
+	} else {
+		reinterpret_cast<void (*)(int)>(handler)(sig);
+	}
+	// POSIX restores the mask the handler ran under when it returns.
+	__atomic_store_n(&sigBlocked, saved, __ATOMIC_RELEASE);
+	return MLIBC_SIGNAL_HANDLED;
+}
+
+void sigNoteDelivery() {
+	__atomic_add_fetch(&sigDeliveries, 1, __ATOMIC_ACQ_REL);
+	twz_rt_futex_wake(reinterpret_cast<_Atomic futex_word *>(&sigDeliveries), FUTEX_WAKE_ALL);
+}
+
+// Deliver anything queued that is no longer blocked.
+void sigDrainPending() {
+	for(;;) {
+		unsigned long blocked = __atomic_load_n(&sigBlocked, __ATOMIC_ACQUIRE);
+		unsigned long ready = __atomic_load_n(&sigPending, __ATOMIC_ACQUIRE) & ~blocked;
+		if(!ready)
+			return;
+		int sig = __builtin_ctzl(ready) + 1;
+		__atomic_fetch_and(&sigPending, ~sigBit(sig), __ATOMIC_ACQ_REL);
+		if(sigDeliver(sig) == MLIBC_SIGNAL_DEFAULT)
+			sigDefaultAction(sig);
+		sigNoteDelivery();
+	}
+}
+
+// Raise a signal against this process, applying the default action here. Used by
+// raise()/abort()/kill(self), where there is no runtime upcall to fall back to.
+void sigRaiseSelf(int sig) {
+	int result = sigDeliver(sig);
+	sigNoteDelivery();
+	if(result == MLIBC_SIGNAL_DEFAULT)
+		sigDefaultAction(sig);
+	sigDrainPending();
+}
+
+// A signal aimed at this thread arrives as an upcall that interrupts the wait itself, so the sleep
+// is bounded rather than indefinite: the handler runs, the counter moves, and the next iteration
+// observes it.
+void sigWaitForDelivery(futex_word expected) {
+	struct option_duration timeout = NO_DURATION;
+	timeout.dur.seconds = 0;
+	timeout.dur.nanos = 50 * 1000 * 1000;
+	timeout.is_some = 1;
+	twz_rt_futex_wait(reinterpret_cast<_Atomic futex_word *>(&sigDeliveries), expected, timeout);
+}
+
+} // namespace
+
+// Called by the reference runtime's default upcall handler on a Mailbox upcall. It resolves this
+// as a weak symbol, so a compartment that does not link mlibc keeps the runtime's own behavior.
+//
+// Returns MLIBC_SIGNAL_HANDLED if a handler ran (or the signal was blocked and is now pending),
+// MLIBC_SIGNAL_IGNORED if the program explicitly installed SIG_IGN, and MLIBC_SIGNAL_DEFAULT if no
+// disposition is installed -- in which case the runtime applies its own default action.
+extern "C" int __mlibc_handle_signal(int sig) {
+	int result = sigDeliver(sig);
+	sigNoteDelivery();
+	sigDrainPending();
+	return result;
+}
+
 int sys_sigaction(int signum, const struct sigaction *act,
 		struct sigaction *oldact) {
-        SYSTRACE("sys_sigaction(signum=%d, act=%p, oldact=%p)", signum, act, oldact);
-    if(oldact) {
-        oldact->sa_handler = SIG_DFL;
-        oldact->sa_flags = 0;
-        sigemptyset(&oldact->sa_mask);
-    }
+	SYSTRACE("sys_sigaction(signum=%d, act=%p, oldact=%p)", signum, act, oldact);
+	if(!sigValid(signum))
+		return EINVAL;
+	// SIGKILL and SIGSTOP dispositions cannot be changed, but may still be queried.
+	if(act && (signum == SIGKILL || signum == SIGSTOP))
+		return EINVAL;
+
+	SigDisposition *disp = &sigDispositions[signum];
+	if(oldact) {
+		uintptr_t handler = __atomic_load_n(&disp->handler, __ATOMIC_ACQUIRE);
+		oldact->sa_flags = disp->flags;
+		sigSetMask(&oldact->sa_mask, disp->mask);
+		// sa_handler and sa_sigaction alias the same union member.
+		oldact->sa_handler = reinterpret_cast<void (*)(int)>(handler);
+	}
+	if(act) {
+		uintptr_t handler = (act->sa_flags & SA_SIGINFO)
+			? reinterpret_cast<uintptr_t>(act->sa_sigaction)
+			: reinterpret_cast<uintptr_t>(act->sa_handler);
+		// Flags and mask must be visible before the handler pointer that selects them.
+		disp->flags = act->sa_flags;
+		disp->mask = sigMaskOf(&act->sa_mask);
+		__atomic_store_n(&disp->handler, handler, __ATOMIC_RELEASE);
+		// Installing SIG_IGN discards anything already queued for this signal.
+		if(handler == reinterpret_cast<uintptr_t>(SIG_IGN))
+			__atomic_fetch_and(&sigPending, ~sigBit(signum), __ATOMIC_ACQ_REL);
+	}
 	return 0;
+}
+
+int sys_sigpending(sigset_t *set) {
+	SYSTRACE("sys_sigpending(set=%p)", set);
+	if(!set)
+		return EINVAL;
+	sigSetMask(set, __atomic_load_n(&sigPending, __ATOMIC_ACQUIRE));
+	return 0;
+}
+
+int sys_pause() {
+	SYSTRACE("sys_pause()");
+	futex_word start = __atomic_load_n(&sigDeliveries, __ATOMIC_ACQUIRE);
+	for(;;) {
+		sigDrainPending();
+		if(__atomic_load_n(&sigDeliveries, __ATOMIC_ACQUIRE) != start)
+			return EINTR;
+		sigWaitForDelivery(start);
+	}
+}
+
+int sys_sigsuspend(const sigset_t *set) {
+	SYSTRACE("sys_sigsuspend(set=%p)", set);
+	unsigned long saved = __atomic_load_n(&sigBlocked, __ATOMIC_ACQUIRE);
+	unsigned long wanted = sigMaskOf(set) & ~(sigBit(SIGKILL) | sigBit(SIGSTOP));
+	__atomic_store_n(&sigBlocked, wanted, __ATOMIC_RELEASE);
+	int result = sys_pause();
+	__atomic_store_n(&sigBlocked, saved, __ATOMIC_RELEASE);
+	sigDrainPending();
+	return result;
 }
 
 // Helper: Convert POSIX sockaddr to Twizzler socket_address
@@ -1695,9 +1906,35 @@ int sys_execve(const char *path, char *const argv[], char *const envp[]) {
 
 int sys_sigprocmask(int how, const sigset_t *set, sigset_t *old) {
     SYSTRACE("sys_sigprocmask(how=%d, set=%p, old=%p)", how, set, old);
-	int result = 0;
-	SYSTRACE("sys_sigprocmask returning %d", result);
-	return result;
+	if(old)
+		sigSetMask(old, __atomic_load_n(&sigBlocked, __ATOMIC_ACQUIRE));
+	if(!set)
+		return 0;
+
+	// SIGKILL and SIGSTOP can never be blocked.
+	unsigned long requested = sigMaskOf(set) & ~(sigBit(SIGKILL) | sigBit(SIGSTOP));
+	switch(how) {
+		case SIG_BLOCK:
+			__atomic_fetch_or(&sigBlocked, requested, __ATOMIC_ACQ_REL);
+			break;
+		case SIG_UNBLOCK:
+			__atomic_fetch_and(&sigBlocked, ~requested, __ATOMIC_ACQ_REL);
+			break;
+		case SIG_SETMASK:
+			__atomic_store_n(&sigBlocked, requested, __ATOMIC_RELEASE);
+			break;
+		default:
+			return EINVAL;
+	}
+	// Unblocking can make queued signals deliverable.
+	sigDrainPending();
+	return 0;
+}
+
+int sys_thread_sigmask(int how, const sigset_t *set, sigset_t *retrieve) {
+	// The mask is compartment-wide rather than per-thread: signals are only ever delivered to the
+	// compartment's main thread, so a per-thread mask would have nothing to gate.
+	return sys_sigprocmask(how, set, retrieve);
 }
 
 int sys_setresuid(uid_t ruid, uid_t euid, uid_t suid) {
@@ -1838,7 +2075,10 @@ extern "C" const char __mlibc_syscall_end[1];
 
 int sys_tgkill(int tgid, int tid, int sig) {
     SYSTRACE("sys_tgkill(tgid=%d, tid=%d, sig=%d)", tgid, tid, sig);
-	int result = ENOSYS;
+	// Delivery is compartment-wide, so there is no thread to select: pthread_kill() against any
+	// thread of this process raises the signal against the process.
+	(void)tid;
+	int result = sys_kill(tgid, sig);
 	SYSTRACE("sys_tgkill returning %d", result);
 	return result;
 }
@@ -2603,10 +2843,10 @@ pid_t sys_gettid() {
 
 int sys_sigaltstack(const stack_t *ss, stack_t *oss) {
     SYSTRACE("sys_sigaltstack(ss=%p, oss=%p)", ss, oss);
-    // Signals are not delivered yet, so this only has to record what was set and report it
-    // back. Both arguments are independently optional: sigaltstack(NULL, &old) queries and
-    // sigaltstack(&new, NULL) sets.
-    // Not per-thread, unlike POSIX -- irrelevant until signal delivery exists.
+    // Handlers run on the interrupted thread's own stack -- SA_ONSTACK is not honored -- so this
+    // only records what was set and reports it back. Both arguments are independently optional:
+    // sigaltstack(NULL, &old) queries and sigaltstack(&new, NULL) sets.
+    // Not per-thread, unlike POSIX.
     static stack_t current = { .ss_sp = nullptr, .ss_flags = SS_DISABLE, .ss_size = 0 };
 
     if (ss && (ss->ss_flags & ~(SS_DISABLE | SS_ONSTACK))) {
@@ -2679,7 +2919,23 @@ gid_t sys_getegid() {
 
 int sys_kill(int pid, int sig) {
     SYSTRACE("sys_kill(pid=%d, sig=%d)", pid, sig);
-	int result = ENOSYS;
+	if(sig != 0 && !sigValid(sig))
+		return EINVAL;
+	// getpid() is always 1 and sys_spawn hands the child's descriptor back as its pid, so any
+	// other value names a child compartment. Self-directed signals have to be dispatched here
+	// rather than posted: raise()/abort() must take effect before returning.
+	if(pid == sys_getpid()) {
+		if(sig != 0)
+			sigRaiseSelf(sig);
+		SYSTRACE("sys_kill returning 0 (self)");
+		return 0;
+	}
+	if(sig == 0) {
+		// Existence probe; nothing to post.
+		return 0;
+	}
+	uint64_t raw = (uint64_t)sig;
+	int result = twz_error_errno(twz_rt_fd_set_config(pid, IO_REGISTER_SIGNAL, &raw, sizeof(raw)));
 	SYSTRACE("sys_kill returning %d", result);
 	return result;
 }

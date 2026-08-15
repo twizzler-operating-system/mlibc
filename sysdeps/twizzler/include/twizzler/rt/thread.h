@@ -16,6 +16,16 @@ typedef uint32_t futex_word;
 extern twz_error twz_rt_futex_wait(_Atomic futex_word *ptr, futex_word expected, struct option_duration timeout);
 /// Wake up up to max threads waiting on ptr. If max is set to FUTEX_WAKE_ALL, wake all threads.
 extern twz_error twz_rt_futex_wake(_Atomic futex_word *ptr, int64_t max);
+/// As twz_rt_futex_wake, but reports how many threads were actually woken.
+///
+/// The count is not a nicety: libstd's RwLock asks "did I wake a writer?" and, told no, wakes every
+/// waiting reader as well rather than risk nobody making progress. With only an error code to go
+/// on the answer was always "no", so every contended write-unlock woke the whole reader set.
+///
+/// Kept separate from twz_rt_futex_wake rather than replacing it, because that one is also called
+/// from mlibc (sys_futex_wake) and from libcxx's atomic.cpp, and changing its return type would
+/// mean rebuilding libcxx inside llvm-project for a value neither caller wants.
+extern struct u32_result twz_rt_futex_wake_count(_Atomic futex_word *ptr, int64_t max);
 
 /// Wake all threads instead of a maximum number
 const int64_t FUTEX_WAKE_ALL = -1;
@@ -29,6 +39,26 @@ extern void twz_rt_set_name(const char *name);
 extern void twz_rt_get_name(const void *tcb, char *name, size_t *len);
 /// Sleep the calling thread for specified duration.
 extern void twz_rt_sleep(struct duration dur);
+
+/// Get a pointer to the calling thread's interrupt-generation word.
+///
+/// The word counts signal handlers that have run on this thread and that should interrupt a
+/// blocking operation. A blocking call samples it on entry and reports "interrupted" once it has
+/// moved. Because it is ordinary memory it can also be handed to a sleep as an extra wait operand,
+/// which is what keeps a handler that ran just before the sleep from being slept through.
+///
+/// The pointer is stable for the lifetime of the thread, and only that thread may access the word.
+/// Accesses must be atomic; the type is spelled plainly here only because the word is also passed
+/// to the kernel as a thread-sync operand.
+extern uint64_t *twz_rt_interrupt_word(void);
+
+/// Record that a signal handler which should interrupt blocking operations has run on this thread.
+///
+/// This is deliberately not called for every signal. POSIX interrupts a blocking call only when a
+/// handler is actually caught and `SA_RESTART` is clear; ignored signals and restarting handlers
+/// leave the call alone. Only the layer holding the handler table -- libc -- knows which case
+/// applies, so the runtime exports the mechanism and libc decides when to use it.
+extern void twz_rt_interrupt_bump(void);
 
 /// TLS index, module ID and offset.
 struct tls_index {
