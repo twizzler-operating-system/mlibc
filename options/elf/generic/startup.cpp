@@ -18,6 +18,8 @@ extern "C" size_t __preinit_array_start[];
 extern "C" size_t __preinit_array_end[];
 
 extern "C" uintptr_t *__dlapi_entrystack();
+// Same symbol unistd.h declares; startup.cpp (elf option) avoids the posix-option header.
+extern "C" char **environ;
 
 namespace {
 	const char *secure_ignore[] = {
@@ -69,6 +71,19 @@ void set_startup_data(int argc, char **argv, char **envp) {
 
 	// Initialize environ.
 	// TODO: Copy the arguments instead of pointing to them?
+	//
+	// Non-secure processes adopt the entry-stack vector directly (as glibc does): putenv-per-var
+	// ran find_environ_index over all prior entries -- O(n^2) in the variable count, measured as
+	// most of init_libc's ~165us on every process start (Twizzler spawnbench.md). The lazy-copy
+	// machinery putenv/setenv already have (`update_vector`) makes adoption safe: the first
+	// mutation copies the pointers into the heap vector exactly as before. putenv never copied
+	// the strings themselves, so the lifetime assumption (entry stack outlives the process) is
+	// unchanged.
+	if(!mlibc::rtldConfig().secureRequired) {
+		environ = envp;
+		return;
+	}
+
 	auto should_ignore_when_secure = [](frg::string_view view) {
 		auto it = secure_ignore;
 		while(*it && view != *it)
@@ -87,7 +102,7 @@ void set_startup_data(int argc, char **argv, char **envp) {
 					<< "\" does not contain an equals sign (=)" << frg::endlog;
 		}
 
-		if(!mlibc::rtldConfig().secureRequired || !should_ignore_when_secure(view.sub_string(0, s))) {
+		if(!should_ignore_when_secure(view.sub_string(0, s))) {
 			auto fail = mlibc::putenv(*ev);
 			__ensure(!fail);
 		}

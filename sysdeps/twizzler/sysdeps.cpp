@@ -764,25 +764,24 @@ int sys_seek(int fd, off_t offset, int whenc, off_t *new_offset) {
 	return twz_error_errno(res.err);
 }
 
+// Accepted without effect: Twizzler does not model file modes. The runtime reports a constant
+// S_IRWXU|S_IRWXG|S_IRWXO for every file, so there is no stored mode to change and no enforcement
+// that could act on one. Refusing instead makes cp/mv/install fail outright over a property that
+// does not exist here.
 int sys_chmod(const char *pathname, mode_t mode) {
-    SYSTRACE("sys_chmod(pathname=%s, mode=%o)", pathname, mode);
-	int result = ENOSYS;
-	SYSTRACE("sys_chmod returning %d", result);
-	return result;
+    SYSTRACE("sys_chmod(pathname=%s, mode=%o): accepting without effect", pathname, mode);
+	return 0;
 }
 
 int sys_fchmod(int fd, mode_t mode) {
-    SYSTRACE("sys_fchmod(fd=%d, mode=%o)", fd, mode);
-	int result = ENOSYS;
-	SYSTRACE("sys_fchmod returning %d", result);
-	return result;
+    SYSTRACE("sys_fchmod(fd=%d, mode=%o): accepting without effect", fd, mode);
+	return 0;
 }
 
 int sys_fchmodat(int fd, const char *pathname, mode_t mode, int flags) {
-    SYSTRACE("sys_fchmodat(fd=%d, pathname=%s, mode=%o, flags=%d)", fd, pathname, mode, flags);
-	int result = ENOSYS;
-	SYSTRACE("sys_fchmodat returning %d", result);
-	return result;
+    SYSTRACE("sys_fchmodat(fd=%d, pathname=%s, mode=%o, flags=%d): accepting without effect",
+             fd, pathname, mode, flags);
+	return 0;
 }
 
 int sys_fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags) {
@@ -965,7 +964,7 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat
         }
         opened_fd = true;
     }
-    struct fd_info info;
+    struct fd_info info = {};
     bool got_info = twz_rt_fd_get_info(fd, &info);
     if (opened_fd) {
         twz_rt_fd_close(fd);
@@ -974,7 +973,14 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat
         return EBADF;
     }
     SYSTRACE("sys_stat: got fd info: mode=%o, len=%ld", info.unix_mode, info.len);
-    statbuf->st_dev = 0;
+
+    // Callers hand us an uninitialized struct stat, and POSIX requires every field to be
+    // written. An unwritten field is not cosmetic here: LLVM's
+    // raw_fd_ostream::preferred_buffer_size() returns st_blksize verbatim and then does
+    // `new char[that]`, so the caller's own stack garbage became a ~347GB request that wedged
+    // rustc in the allocator's grow-retry loop. Zero first, then fill -- that also covers
+    // st_blocks, the timespec nanosecond halves, and any field the ABI grows later.
+    memset(statbuf, 0, sizeof(*statbuf));
     statbuf->st_ino = objid_to_ino(info.id);
     // The runtime reports a full mode (type bits | permissions). Only synthesize one if it
     // didn't fill the field in, otherwise we'd clobber the real permissions.
@@ -990,16 +996,21 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat
         }
     }
     statbuf->st_nlink = 1;
-    statbuf->st_uid = 0;
-    statbuf->st_gid = 0;
-    statbuf->st_rdev = 0;
-    statbuf->st_atime = info.accessed.seconds;
-    statbuf->st_mtime = info.modified.seconds;
-    statbuf->st_ctime = info.created.seconds;
     statbuf->st_size = info.len;
+    statbuf->st_blksize = 0x1000;
+    statbuf->st_blocks = (blkcnt_t)((info.len + 511) / 512);
+    statbuf->st_atim.tv_sec = info.accessed.seconds;
+    statbuf->st_atim.tv_nsec = info.accessed.nanos;
+    statbuf->st_mtim.tv_sec = info.modified.seconds;
+    statbuf->st_mtim.tv_nsec = info.modified.nanos;
+    statbuf->st_ctim.tv_sec = info.created.seconds;
+    statbuf->st_ctim.tv_nsec = info.created.nanos;
     return 0;
 }
 
+// Left ENOSYS deliberately: mlibc's linux_option is off for this build, so <sys/statfs.h> is not
+// installed and `struct statfs` is an incomplete type here -- it cannot be filled in, and no
+// userspace caller can reach statfs() without the header anyway.
 int sys_statfs(const char *path, struct statfs *buf) {
     SYSTRACE("sys_statfs(path=%s, buf=%p)", path, buf);
     sys_libc_log("call to statfs");
@@ -1951,18 +1962,29 @@ int sys_setresgid(gid_t rgid, gid_t egid, gid_t sgid) {
 	return result;
 }
 
+// There is one identity and no user database, so report it rather than refusing. The matching
+// setres*/setre* calls stay ENOSYS: succeeding there would tell a caller it had changed
+// privileges when it had not.
 int sys_getresuid(uid_t *ruid, uid_t *euid, uid_t *suid) {
     SYSTRACE("sys_getresuid(ruid=%p, euid=%p, suid=%p)", ruid, euid, suid);
-	int result = ENOSYS;
-	SYSTRACE("sys_getresuid returning %d", result);
-	return result;
+	if (ruid)
+		*ruid = 0;
+	if (euid)
+		*euid = 0;
+	if (suid)
+		*suid = 0;
+	return 0;
 }
 
 int sys_getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid) {
     SYSTRACE("sys_getresgid(rgid=%p, egid=%p, sgid=%p)", rgid, egid, sgid);
-	int result = ENOSYS;
-	SYSTRACE("sys_getresgid returning %d", result);
-	return result;
+	if (rgid)
+		*rgid = 0;
+	if (egid)
+		*egid = 0;
+	if (sgid)
+		*sgid = 0;
+	return 0;
 }
 
 int sys_setreuid(uid_t ruid, uid_t euid) {
@@ -3011,11 +3033,16 @@ int sys_mkfifoat(int dirfd, const char *path, mode_t mode) {
 
 // sys_symlink and sys_symlinkat are implemented further down, with the other namespace ops.
 
+// Stored but unused: nothing here creates files with a mode, so the mask gates nothing. Callers
+// (mktemp, install) set it and restore it, and need the previous value back to do so.
+static mode_t twz_umask = 022;
+
 int sys_umask(mode_t mode, mode_t *old) {
     SYSTRACE("sys_umask(mode=%o, old=%p)", mode, old);
-	int result = ENOSYS;
-	SYSTRACE("sys_umask returning %d", result);
-	return result;
+	if (old)
+		*old = twz_umask;
+	twz_umask = mode & 0777;
+	return 0;
 }
 
 int sys_chdir(const char *path) {
@@ -3133,11 +3160,15 @@ int sys_getpgid(pid_t pid, pid_t *out) {
 	return 0;
 }
 
+// No group model: the supplementary group list is genuinely empty, which is an answer rather
+// than a refusal.
 int sys_getgroups(size_t size, gid_t *list, int *retval) {
     SYSTRACE("sys_getgroups(size=%ld, list=%p, retval=%p)", size, list, retval);
-	int result = ENOSYS;
-	SYSTRACE("sys_getgroups returning %d", result);
-	return result;
+	(void)size;
+	(void)list;
+	if (retval)
+		*retval = 0;
+	return 0;
 }
 
 int sys_dup(int fd, int flags, int *newfd) {

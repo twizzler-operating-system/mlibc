@@ -13,11 +13,27 @@
 
 namespace {
 
-mlibc::localeinfo cLocale{};
-mlibc::localeinfo startingLocale{};
+// Both default-locale objects are constructed lazily: each builds 13 nl_* category tables with
+// per-category heap strings, and doing that from a global constructor cost ~106us of every
+// process start -- paid even by programs that never touch locale or ctype at all (measured on
+// Twizzler, spawnbench.md; the guard is mlibc's own __cxa_guard from options/internal/gcc).
+// `startingLocaleRaw` exists so freeLocale can test identity without forcing construction.
+mlibc::localeinfo *startingLocaleRaw = nullptr;
+
+mlibc::localeinfo &cLocale() {
+	static mlibc::localeinfo l{};
+	return l;
+}
+
+mlibc::localeinfo &startingLocale() {
+	static mlibc::localeinfo l{};
+	startingLocaleRaw = &l;
+	return l;
+}
 
 thread_local mlibc::localeinfo *current_locale = nullptr;
-mlibc::localeinfo *current_global_locale = &startingLocale;
+// nullptr means "startingLocale, not yet constructed"; the accessors materialize it on demand.
+mlibc::localeinfo *current_global_locale = nullptr;
 
 // handle to the opened locale-archive file, if any
 smarter::shared_ptr<file_window> localeArchive;
@@ -62,7 +78,7 @@ frg::string<MemoryAllocator> normalizeCodeset(frg::string_view codeset) {
 	bool only_digit = true;
 
 	for (size_t i = 0; i < codeset.size(); i++) {
-		if (only_digit && !mlibc::isdigit_l(codeset[i], &cLocale))
+		if (only_digit && !mlibc::isdigit_l(codeset[i], &cLocale()))
 			only_digit = false;
 	}
 
@@ -72,9 +88,9 @@ frg::string<MemoryAllocator> normalizeCodeset(frg::string_view codeset) {
 		normalized += "iso";
 
 	for(size_t i = 0; i < codeset.size(); i++) {
-		if (mlibc::isalpha_l(codeset[i], &cLocale))
-			normalized.push_back(tolower_l(codeset[i], &cLocale));
-		else if (mlibc::isdigit_l(codeset[i], &cLocale))
+		if (mlibc::isalpha_l(codeset[i], &cLocale()))
+			normalized.push_back(tolower_l(codeset[i], &cLocale()));
+		else if (mlibc::isdigit_l(codeset[i], &cLocale()))
 			normalized.push_back(codeset[i]);
 	}
 
@@ -596,52 +612,52 @@ bool applyCategory(int category, frg::string_view name, localeinfo *info) {
 		switch (category) {
 			case LC_CTYPE:
 				info->ctype.localeName = frg::string{name, getAllocator()};
-				info->ctype = cLocale.ctype;
+				info->ctype = cLocale().ctype;
 				break;
 			case LC_NUMERIC:
 				info->numeric.localeName = frg::string{name, getAllocator()};
-				info->numeric = cLocale.numeric;
+				info->numeric = cLocale().numeric;
 				break;
 			case LC_TIME:
 				info->time.localeName = frg::string{name, getAllocator()};
-				info->time = cLocale.time;
+				info->time = cLocale().time;
 				break;
 			case LC_COLLATE:
 				info->collate.localeName = frg::string{name, getAllocator()};
-				info->collate = cLocale.collate;
+				info->collate = cLocale().collate;
 				break;
 			case LC_MONETARY:
 				info->monetary.localeName = frg::string{name, getAllocator()};
-				info->monetary = cLocale.monetary;
+				info->monetary = cLocale().monetary;
 				break;
 			case LC_MESSAGES:
 				info->messages.localeName = frg::string{name, getAllocator()};
-				info->messages = cLocale.messages;
+				info->messages = cLocale().messages;
 				break;
 			// skip LC_ALL
 			case LC_PAPER:
 				info->paper.localeName = frg::string{name, getAllocator()};
-				info->paper = cLocale.paper;
+				info->paper = cLocale().paper;
 				break;
 			case LC_NAME:
 				info->name.localeName = frg::string{name, getAllocator()};
-				info->name = cLocale.name;
+				info->name = cLocale().name;
 				break;
 			case LC_ADDRESS:
 				info->address.localeName = frg::string{name, getAllocator()};
-				info->address = cLocale.address;
+				info->address = cLocale().address;
 				break;
 			case LC_TELEPHONE:
 				info->telephone.localeName = frg::string{name, getAllocator()};
-				info->telephone = cLocale.telephone;
+				info->telephone = cLocale().telephone;
 				break;
 			case LC_MEASUREMENT:
 				info->measurement.localeName = frg::string{name, getAllocator()};
-				info->measurement = cLocale.measurement;
+				info->measurement = cLocale().measurement;
 				break;
 			case LC_IDENTIFICATION:
 				info->identification.localeName = frg::string{name, getAllocator()};
-				info->identification = cLocale.identification;
+				info->identification = cLocale().identification;
 				break;
 			default:
 				mlibc::infoLogger() << "mlibc: unhandled defaults for category "
@@ -738,23 +754,31 @@ localeinfo *useThreadLocalLocale(localeinfo *loc) {
 #endif // __MLIBC_POSIX_OPTION
 
 localeinfo *useGlobalLocale(localeinfo *loc) {
-	localeinfo *old = current_global_locale;
+	// The caller receives the previous global to restore later, so a never-materialized
+	// starting locale must materialize here rather than hand back nullptr.
+	localeinfo *old = current_global_locale ? current_global_locale : &startingLocale();
 	current_global_locale = reinterpret_cast<localeinfo *>(loc);
 	return old;
 }
 
 void freeLocale(localeinfo *loc) {
-	if(loc && loc != &startingLocale)
+	// startingLocaleRaw is null until startingLocale() first runs; loc can only equal it if it
+	// was handed out, so the null case correctly falls through to destruct.
+	if(loc && loc != startingLocaleRaw)
 		frg::destruct(getAllocator(), reinterpret_cast<localeinfo *>(loc));
 }
 
 localeinfo *getActiveLocale() {
 	if (current_locale)
 		return current_locale;
+	if (!current_global_locale)
+		current_global_locale = &startingLocale();
 	return current_global_locale;
 }
 
 localeinfo *getGlobalLocale() {
+	if (!current_global_locale)
+		current_global_locale = &startingLocale();
 	return current_global_locale;
 }
 

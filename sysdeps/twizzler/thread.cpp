@@ -80,7 +80,15 @@ extern "C" void __mlibc_enter_thread(void *user_arg) {
 namespace mlibc {
 
 extern "C" void __mlibc_handle_thread_exit(void *pointer, int ret_val) {
-	run_dtors_for_tcb(reinterpret_cast<Tcb *>(pointer), ret_val);
+	auto tcb = reinterpret_cast<Tcb *>(pointer);
+	run_dtors_for_tcb(tcb, ret_val);
+	// The runtime recycles TCB regions and re-initializes them from the TLS template, so this is
+	// the last point initBasicTcb's localKeys allocation is reachable: free it here or leak 16 KiB
+	// per thread. Ordered after the dtors, which read it.
+	if (tcb->localKeys) {
+		frg::destruct(getAllocator(), tcb->localKeys);
+		tcb->localKeys = nullptr;
+	}
 }
 
 static constexpr size_t default_stacksize = 0x200000;
