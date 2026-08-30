@@ -189,9 +189,218 @@ fail:
 }
 
 #if defined(__Twizzler__)
+#include <string.h>
+
+#include <twizzler/rt/exec.h>
+#include <twizzler/rt/fd.h>
+
 namespace mlibc {
 int sys_spawn(int *, const char *, char *const*, char *const*);
 }
+
+// Defined in sysdeps/twizzler/sysdeps.cpp, which has no header of its own to declare it -- the
+// twizzler include dir holds only verbatim copies of the ABI headers, so a declaration must not
+// be added there. Same forward-declaration pattern as sys_spawn above.
+int twz_error_errno(uint64_t err);
+
+namespace {
+
+// Twizzler has no fork, so there is no child context in which to replay file actions before the
+// exec. They have to be resolved here, in the parent, into the fd_binds array twz_rt_exec_spawn
+// takes -- the same array libstd's build_bindings constructs for Command's stdio redirects.
+struct bind_set {
+	binding_info *b = nullptr;
+	// Parallel to b: entry was produced by a file action rather than inherited. Such an entry
+	// names a descriptor that need not exist in this process, so its cloexec state cannot be
+	// queried and must not be.
+	char *made = nullptr;
+	size_t n = 0, cap = 0;
+};
+
+static void bs_free(bind_set *bs) {
+	free(bs->b);
+	free(bs->made);
+	bs->b = nullptr;
+	bs->made = nullptr;
+	bs->n = bs->cap = 0;
+}
+
+static int bs_grow(bind_set *bs, size_t want) {
+	if(want <= bs->cap)
+		return 0;
+	size_t cap = bs->cap ? bs->cap : 8;
+	while(cap < want)
+		cap *= 2;
+	auto nb = (binding_info *)realloc(bs->b, cap * sizeof(binding_info));
+	if(!nb)
+		return ENOMEM;
+	bs->b = nb;
+	auto nm = (char *)realloc(bs->made, cap);
+	if(!nm)
+		return ENOMEM;
+	bs->made = nm;
+	bs->cap = cap;
+	return 0;
+}
+
+// Load every descriptor this process holds. Cloexec entries are deliberately included: in a
+// fork+exec the child still has them while the file actions run, and only execve drops them, so
+// a dup2 whose source is cloexec has to work. They are filtered at the end instead.
+static int bs_load(bind_set *bs) {
+	for(;;) {
+		if(int e = bs_grow(bs, bs->cap ? bs->cap * 2 : 8))
+			return e;
+		size_t n = twz_rt_fd_read_binds(bs->b, bs->cap);
+		if(n < bs->cap) {
+			bs->n = n;
+			memset(bs->made, 0, bs->cap);
+			return 0;
+		}
+	}
+}
+
+static ssize_t bs_find(bind_set *bs, int fd) {
+	for(size_t i = 0; i < bs->n; i++)
+		if(bs->b[i].fd == fd)
+			return (ssize_t)i;
+	return -1;
+}
+
+static void bs_remove(bind_set *bs, int fd) {
+	ssize_t i = bs_find(bs, fd);
+	if(i < 0)
+		return;
+	bs->b[i] = bs->b[bs->n - 1];
+	bs->made[i] = bs->made[bs->n - 1];
+	bs->n--;
+}
+
+// Place a copy of `src` at descriptor `fd`, displacing whatever was there. Marks it as made, so
+// the closing cloexec filter leaves it alone -- a redirect target is not an inherited descriptor.
+static int bs_place(bind_set *bs, binding_info copy, int fd) {
+	copy.fd = fd;
+	ssize_t at = bs_find(bs, fd);
+	if(at < 0) {
+		if(int e = bs_grow(bs, bs->n + 1))
+			return e;
+		at = (ssize_t)bs->n++;
+	}
+	bs->b[at] = copy;
+	bs->made[at] = 1;
+	return 0;
+}
+
+// Resolve one posix_spawn file-action list and spawn. Actions are applied in the order they were
+// added (the list is built in reverse, hence the walk to the tail and back), against a working
+// copy of our binding set -- never against this process's real descriptor table, which a
+// concurrent thread is entitled to be using.
+static int twz_spawn_with_actions(pid_t *out_pid, const char *path,
+		const posix_spawn_file_actions_t *fa, char *const argv[], char *const envp[]) {
+	bind_set bs{};
+	int *tmpfds = nullptr;
+	size_t ntmp = 0;
+	int ec = bs_load(&bs);
+
+	if(!ec && fa && fa->__actions) {
+		struct fdop *op;
+		for(op = (struct fdop *)fa->__actions; op->next; op = op->next)
+			;
+		for(; op && !ec; op = op->prev) {
+			switch(op->cmd) {
+			case FDOP_CLOSE:
+				bs_remove(&bs, op->fd);
+				break;
+			case FDOP_DUP2: {
+				ssize_t i = bs_find(&bs, op->srcfd);
+				if(i < 0) {
+					ec = EBADF;
+					break;
+				}
+				ec = bs_place(&bs, bs.b[i], op->fd);
+				break;
+			}
+			case FDOP_OPEN: {
+				// Opened here rather than in the child, because there is no child yet. The
+				// descriptor is ours until the spawn completes, then closed.
+				int fd = open(op->path, op->oflag, op->mode);
+				if(fd < 0) {
+					ec = errno;
+					break;
+				}
+				auto nt = (int *)realloc(tmpfds, (ntmp + 1) * sizeof(int));
+				if(!nt) {
+					close(fd);
+					ec = ENOMEM;
+					break;
+				}
+				tmpfds = nt;
+				tmpfds[ntmp++] = fd;
+
+				bind_set fresh{};
+				ec = bs_load(&fresh);
+				if(!ec) {
+					ssize_t i = bs_find(&fresh, fd);
+					if(i < 0)
+						ec = EBADF;
+					else
+						ec = bs_place(&bs, fresh.b[i], op->fd);
+				}
+				bs_free(&fresh);
+				break;
+			}
+			case FDOP_CHDIR:
+			case FDOP_FCHDIR:
+				// Refused rather than ignored. There is no per-process cwd (sys_chdir is
+				// ENOSYS), so accepting would hand the child a directory it is not in.
+				ec = ENOSYS;
+				break;
+			default:
+				ec = EINVAL;
+				break;
+			}
+		}
+	}
+
+	// Now, and not before: a descriptor still marked close-on-exec does not cross. Entries a
+	// file action produced are exempt -- those are redirect targets the caller asked for, and
+	// dup2 clears the flag on its destination anyway. Same ordering as libstd's build_bindings,
+	// and for the same reason: filtering earlier discards what was explicitly passed down.
+	for(size_t i = 0; i < bs.n && !ec;) {
+		uint32_t ce = 0;
+		if(!bs.made[i] && twz_rt_fd_cmd(bs.b[i].fd, FD_CMD_GET_CLOEXEC, nullptr, &ce) == SUCCESS
+				&& ce) {
+			bs.b[i] = bs.b[bs.n - 1];
+			bs.made[i] = bs.made[bs.n - 1];
+			bs.n--;
+		} else {
+			i++;
+		}
+	}
+
+	if(!ec) {
+		struct exec_spawn_args sa = {
+			.prog = path,
+			.args = (const char *const *)argv,
+			.env = (const char *const *)envp,
+			.fd_binds = bs.b,
+			.fd_bind_count = bs.n,
+			.flags = 0,
+		};
+		struct open_result r = twz_rt_exec_spawn(&sa);
+		if(r.err != SUCCESS)
+			ec = twz_error_errno(r.err);
+		else
+			*out_pid = r.fd;
+	}
+
+	for(size_t i = 0; i < ntmp; i++)
+		close(tmpfds[i]);
+	free(tmpfds);
+	bs_free(&bs);
+	return ec;
+}
+
+} // namespace
 #endif
 int posix_spawn(pid_t *__restrict res, const char *__restrict path,
 		const posix_spawn_file_actions_t *file_actions,
@@ -225,8 +434,12 @@ int posix_spawn(pid_t *__restrict res, const char *__restrict path,
 
 #if defined(__Twizzler__)
 	/* On Twizzler, use the Twizzler spawn API directly */
+	// The fork path below captures the old mask as a side effect of blocking signals; this path
+	// does not block (there is no shared-memory child to protect), so capture it explicitly.
+	// Without this the restore at `fail:` installs whatever was on the stack.
+	pthread_sigmask(SIG_SETMASK, nullptr, &args.oldmask);
 	pid_t spawned_pid;
-	int ret = mlibc::sys_spawn(&spawned_pid, path, argv, envp);
+	int ret = twz_spawn_with_actions(&spawned_pid, path, file_actions, argv, envp);
 	if(ret) {
 		ec = ret;
 		goto fail;

@@ -802,15 +802,131 @@ int sys_utimensat(int dirfd, const char *pathname, const struct timespec times[2
 	return result;
 }
 
+// Object data begins one page in: object_handle::start is the base of the object, despite the
+// ABI header describing it as "start of object data". Confirmed against new_object_handle in the
+// reference runtime, which sets start = slot * MAX_SIZE and meta = start + MAX_SIZE - LEN_MUL.
+#define TWZ_OBJ_DATA_OFF 0x1000
+
+// File-backed regions handed out by sys_vm_map, so sys_vm_unmap can release the right handle.
+//
+// Anonymous mappings are deliberately *not* recorded. They come from twz_rt_malloc, which this
+// libc's own allocator is built on, so allocating a record for one would re-enter the allocator.
+// Their existing leak on unmap is untouched by this code -- fixing it needs the allocator path
+// looked at as its own change, not a rider on this one.
+#define TWZ_VM_MAX_MAPS 128
+static struct {
+	void *base;
+	size_t len;
+	struct object_handle handle;
+	unsigned char used;
+} vm_maps[TWZ_VM_MAX_MAPS];
+static unsigned char vm_maps_lock;
+
+static void vm_maps_acquire(void) {
+	while(__atomic_test_and_set(&vm_maps_lock, __ATOMIC_ACQUIRE))
+		;
+}
+
+static void vm_maps_release(void) {
+	__atomic_clear(&vm_maps_lock, __ATOMIC_RELEASE);
+}
+
+static bool vm_map_record(void *base, size_t len, const struct object_handle *h) {
+	vm_maps_acquire();
+	for(size_t i = 0; i < TWZ_VM_MAX_MAPS; i++) {
+		if(!vm_maps[i].used) {
+			vm_maps[i].base = base;
+			vm_maps[i].len = len;
+			vm_maps[i].handle = *h;
+			vm_maps[i].used = 1;
+			vm_maps_release();
+			return true;
+		}
+	}
+	vm_maps_release();
+	return false;
+}
+
+// Takes the record covering exactly `base`, if there is one. Partial unmapping is not supported:
+// a caller unmapping half a region gets no action rather than a released handle for the whole of
+// it, which would leave the surviving half pointing at nothing.
+static bool vm_map_take(void *base, struct object_handle *out) {
+	vm_maps_acquire();
+	for(size_t i = 0; i < TWZ_VM_MAX_MAPS; i++) {
+		if(vm_maps[i].used && vm_maps[i].base == base) {
+			*out = vm_maps[i].handle;
+			vm_maps[i].used = 0;
+			vm_maps_release();
+			return true;
+		}
+	}
+	vm_maps_release();
+	return false;
+}
+
+static map_flags twz_prot_to_map_flags(int prot) {
+	map_flags f = 0;
+	if(prot & PROT_READ)
+		f |= MAP_FLAG_R;
+	if(prot & PROT_WRITE)
+		f |= MAP_FLAG_W;
+	if(prot & PROT_EXEC)
+		f |= MAP_FLAG_X;
+	return f;
+}
+
 int sys_vm_map(void *hint, size_t size, int prot, int flags,
 		int fd, off_t offset, void **window) {
-		//sys_libc_log("call to vm_map");
-		if(!(flags & MAP_ANON) || fd != -1) {
-		    return ENOTSUP;
+    SYSTRACE("sys_vm_map(size=%ld, prot=%d, flags=%d, fd=%d, offset=%ld)", size, prot, flags, fd, offset);
+	if(!size)
+		return EINVAL;
+
+	if(!(flags & MAP_ANON)) {
+		if(fd < 0)
+			return EBADF;
+		if(offset < 0 || (offset % TWZ_OBJ_DATA_OFF))
+			return EINVAL;
+		// A private file mapping must keep its writes out of the file. Mapping the object with
+		// write permission is shared, so there is no way to honour this yet; refusing beats
+		// quietly giving the caller a shared mapping it believes is private.
+		if((flags & MAP_PRIVATE) && (prot & PROT_WRITE))
+			return ENOTSUP;
+
+		struct fd_info info;
+		if(!twz_rt_fd_get_info(fd, &info))
+			return EBADF;
+		// Only regular files have a stable address for their bytes. A pty or socket is backed by
+		// an object too, but mapping one would expose ring-buffer state, not file contents.
+		if(info.kind != FdKind_Regular)
+			return ENODEV;
+
+		struct map_result mr = twz_rt_map_object(info.id, twz_prot_to_map_flags(prot));
+		if(mr.error != SUCCESS)
+			return twz_error_errno(mr.error);
+
+		size_t valid = (size_t)mr.handle.valid_len * LEN_MUL;
+		if((uint64_t)offset + size > valid) {
+			// One file is one object, so a range past the data area cannot be made contiguous
+			// with whatever follows it. Refuse rather than hand back a short mapping.
+			twz_rt_release_handle(&mr.handle, 0);
+			return ENOTSUP;
 		}
-  *window = twz_rt_malloc(size, 0x1000, ZERO_MEMORY);
+
+		void *base = (char *)mr.handle.start + TWZ_OBJ_DATA_OFF + offset;
+		if(!vm_map_record(base, size, &mr.handle)) {
+			twz_rt_release_handle(&mr.handle, 0);
+			return ENOMEM;
+		}
+		*window = base;
+		SYSTRACE("sys_vm_map returning 0, window=%p", *window);
+		return 0;
+	}
+
+	if(fd != -1)
+		return ENOTSUP;
+	*window = twz_rt_malloc(size, 0x1000, ZERO_MEMORY);
     if (*window == NULL) {
-        return -1;
+        return ENOMEM;
     }
     return 0;
 	/*
@@ -834,19 +950,32 @@ int sys_vm_map(void *hint, size_t size, int prot, int flags,
 
 int sys_vm_unmap(void *pointer, size_t size) {
     SYSTRACE("sys_vm_unmap(pointer=%p, size=%ld)", pointer, size);
-	/*
-	auto ret = do_syscall(SYS_munmap, pointer, size);
-	if(int e = sc_error(ret); e)
-		return e;
-	return 0;
-	*/
+	struct object_handle h;
+	if(vm_map_take(pointer, &h)) {
+		twz_rt_release_handle(&h, 0);
+		SYSTRACE("sys_vm_unmap returning 0 (released object mapping)");
+		return 0;
+	}
+	// Anonymous mappings are not tracked (see vm_maps), so this still returns success having
+	// freed nothing for them -- every such mapping leaks, as it did before this change. Left
+	// alone deliberately: the anonymous path is what mlibc's own allocator sits on, and undoing
+	// it belongs in a change that can be tested against the allocator rather than beside it.
 	int result = 0;
-	SYSTRACE("sys_vm_unmap returning %d", result);
+	SYSTRACE("sys_vm_unmap returning %d (untracked region, nothing released)", result);
 	return result;
 }
 
 int sys_vm_protect(void *pointer, size_t size, int prot) {
     SYSTRACE("sys_vm_protect(pointer=%p, size=%ld, prot=%d)", pointer, size, prot);
+	// Protections are fixed when a region is mapped and there is no call to change them in
+	// place. Requests that only *drop* permissions are accepted: the memory stays more
+	// permissive than asked, which no correct caller can detect. Adding execute is refused,
+	// because a caller told it succeeded will jump into memory that is not executable and take
+	// a fault far from here.
+	if(prot & PROT_EXEC) {
+		SYSTRACE("sys_vm_protect returning ENOSYS (cannot add PROT_EXEC after mapping)");
+		return ENOSYS;
+	}
 	int result = 0;
 	SYSTRACE("sys_vm_protect returning %d", result);
 	return result;
