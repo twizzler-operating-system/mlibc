@@ -170,6 +170,12 @@ const fd_cmd FD_CMD_SHUTDOWN = 3;
 /// for dup2 and fcntl's F_DUPFD). Duplicating a descriptor onto itself succeeds and does nothing.
 /// The ret argument points to a descriptor, set to the target on success.
 const fd_cmd FD_CMD_DUP2 = 4;
+/// Read the close-on-exec flag. The arg argument is ignored. The ret argument points to a
+/// uint32_t, set to non-zero if this descriptor is closed across an exec.
+const fd_cmd FD_CMD_GET_CLOEXEC = 5;
+/// Set or clear the close-on-exec flag. The arg argument points to a uint32_t, non-zero to set.
+/// A descriptor produced by FD_CMD_DUP or FD_CMD_DUP2 always starts with the flag clear.
+const fd_cmd FD_CMD_SET_CLOEXEC = 6;
 
 /// Perform a command on the descriptor. The arguments arg and ret are interpreted according to
 /// the command specified.

@@ -270,9 +270,13 @@ int sys_fadvise(int fd, off_t offset, off_t length, int advice) {
 //    size-rejected. The shadow lets set/getsockopt touch individual flag bits without a
 //    read-modify-write, and stays accurate because the libc is that register's only writer.
 //
-//  - fd_cloexec_table / fd_openflags_table: FD_CLOEXEC, the O_RDONLY/O_WRONLY/O_RDWR access
-//    mode, and whether the descriptor was opened O_APPEND. None of these are stored by the
-//    runtime, and fcntl(F_GETFD/F_GETFL) has to report them.
+//  - fd_openflags_table: the O_RDONLY/O_WRONLY/O_RDWR access mode and whether the descriptor was
+//    opened O_APPEND. Neither is stored by the runtime, and fcntl(F_GETFL) has to report them.
+//
+// FD_CLOEXEC is deliberately *not* in this list. It used to be, and a libc-side table was the
+// wrong home for it: the runtime is what builds a child's inherited descriptor set (read_binds
+// plus the spawn path), so a flag only this libc could see could not affect what the child got.
+// It is now runtime state, reached through FD_CMD_GET_CLOEXEC/FD_CMD_SET_CLOEXEC below.
 //
 // All are plain arrays touched with relaxed atomics: each entry is only meaningful while its
 // descriptor is open, and a descriptor cannot be concurrently opened and used.
@@ -283,7 +287,6 @@ int sys_fadvise(int fd, off_t offset, off_t length, int advice) {
 
 static unsigned char socket_prot_table[TWZ_MAX_TRACKED_FD];
 static uint32_t socket_flags_table[TWZ_MAX_TRACKED_FD];
-static unsigned char fd_cloexec_table[TWZ_MAX_TRACKED_FD];
 
 // Encoding: bits 0-1 hold the access mode, TWZ_FD_TRACKED marks the entry as populated (so an
 // untracked descriptor can default to O_RDWR), and TWZ_FD_APPEND records O_APPEND.
@@ -311,16 +314,19 @@ static int fd_openflags_get(int fd) {
     return (int)(v & 03) | ((v & TWZ_FD_APPEND) ? O_APPEND : 0);
 }
 
+// Close-on-exec lives in the runtime, which is the only party that can act on it. Note the
+// absence of a TWZ_MAX_TRACKED_FD bound: unlike the tables above, this has no fixed-size array
+// behind it, so a high-numbered descriptor is tracked like any other.
 static void fd_cloexec_set(int fd, bool on) {
-    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
-        return;
-    __atomic_store_n(&fd_cloexec_table[fd], on ? 1 : 0, __ATOMIC_RELAXED);
+    uint32_t val = on ? 1 : 0;
+    twz_rt_fd_cmd(fd, FD_CMD_SET_CLOEXEC, &val, NULL);
 }
 
 static bool fd_cloexec_get(int fd) {
-    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
+    uint32_t val = 0;
+    if (twz_rt_fd_cmd(fd, FD_CMD_GET_CLOEXEC, NULL, &val) != SUCCESS)
         return false;
-    return __atomic_load_n(&fd_cloexec_table[fd], __ATOMIC_RELAXED) != 0;
+    return val != 0;
 }
 
 static void socket_prot_set(int fd, int type) {
@@ -336,7 +342,6 @@ static void fd_state_clear(int fd) {
         return;
     __atomic_store_n(&socket_prot_table[fd], TWZ_SOCK_PROT_NONE, __ATOMIC_RELAXED);
     __atomic_store_n(&socket_flags_table[fd], 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&fd_cloexec_table[fd], 0, __ATOMIC_RELAXED);
     __atomic_store_n(&fd_openflags_table[fd], 0, __ATOMIC_RELAXED);
 }
 
@@ -473,9 +478,8 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
         twz_rt_fd_set_config(res.fd, IO_REGISTER_IO_FLAGS, &ioflags, sizeof(ioflags));
     }
 
-    // Record what fcntl(F_GETFD/F_GETFL) will need to report. Note that FD_CLOEXEC is only
-    // bookkeeping: nothing closes these descriptors across an exec yet, because sys_execve
-    // replaces the process without consulting the table.
+    // Record what fcntl(F_GETFL) will need to report, and hand O_CLOEXEC to the runtime, which
+    // drops flagged descriptors when it builds a child's inherited set.
     fd_state_clear(res.fd);
     fd_openflags_set(res.fd, flags);
     fd_cloexec_set(res.fd, (flags & O_CLOEXEC) != 0);
