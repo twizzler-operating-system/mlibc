@@ -89,8 +89,12 @@ struct option_exit_code {
   exit_code value;
 };
 
-/// Exit with provided code
+/// Exit the process with the provided code, from any thread (POSIX exit() semantics).
 _Noreturn void twz_rt_exit(exit_code code);
+/// Exit only the calling thread. Thread trampolines call this when a thread's entry function
+/// returns; nothing else should. Distinct from twz_rt_exit so the runtime can tell a finished
+/// thread from a process-exit request.
+_Noreturn void twz_rt_thread_exit(exit_code code);
 /// Abort immediately
 _Noreturn void twz_rt_abort(void);
 

@@ -3106,7 +3106,8 @@ int sys_kill(int pid, int sig) {
 
 void sys_thread_exit() {
     SYSTRACE("sys_thread_exit()");
-    twz_rt_exit(0);
+    // Thread-exit, not process-exit: twz_rt_exit ends the whole process (POSIX exit()).
+    twz_rt_thread_exit(0);
 }
 
 void sys_exit(int status) {
