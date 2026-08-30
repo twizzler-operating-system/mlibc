@@ -1954,7 +1954,16 @@ int sys_pipe(int *fds, int flags) {
     // Store the file descriptors: [0] is read, [1] is write
     fds[0] = pipe_result.fd;
     fds[1] = write_fd;
-    
+
+    // pipe2's O_CLOEXEC applies to both ends. Dropping it here is not a leaked-descriptor
+    // nicety: the runtime's exec path inherits every non-cloexec fd, so a spawned child
+    // received the write end of its own stdin pipe and EOF-on-parent-close could never
+    // arrive (spawn-test stdin-pipe-eof deadlocked on exactly this).
+    if (flags & O_CLOEXEC) {
+        fd_cloexec_set(fds[0], true);
+        fd_cloexec_set(fds[1], true);
+    }
+
     SYSTRACE("sys_pipe returning 0 (fds[0]=%d for read, fds[1]=%d for write)", fds[0], fds[1]);
     return 0;
 }
