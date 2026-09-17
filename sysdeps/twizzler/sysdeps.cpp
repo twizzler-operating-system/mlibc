@@ -1682,6 +1682,12 @@ static int sockaddr_to_twz_addr(const struct sockaddr *sa, socklen_t len,
     }
 }
 
+int sys_socketpair(int domain, int type_and_flags, int proto, int *fds) {
+    // Only AF_INET/AF_INET6 exist here and neither can be paired; report the family, not a
+    // missing entry point, so callers probing for AF_UNIX get the errno they test for.
+    return EAFNOSUPPORT;
+}
+
 int sys_socket(int domain, int type, int protocol, int *fd) {
     SYSTRACE("sys_socket(domain=%d, type=%d, protocol=%d, fd=%p)", domain, type, protocol, fd);
     

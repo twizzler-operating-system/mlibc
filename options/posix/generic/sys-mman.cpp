@@ -133,6 +133,16 @@ int shm_unlink(const char *name) {
 	return unlink(name);
 }
 
+int madvise(void *addr, size_t length, int advice) {
+	MLIBC_CHECK_OR_ENOSYS(mlibc::sys_madvise, -1);
+	if(int e = mlibc::sys_madvise(addr, length, advice)) {
+		errno = e;
+		return -1;
+	}
+
+	return 0;
+}
+
 #if __MLIBC_LINUX_OPTION
 void *mremap(void *pointer, size_t size, size_t new_size, int flags, ...) {
 	__ensure(flags == MREMAP_MAYMOVE);
@@ -163,15 +173,6 @@ int memfd_create(const char *name, unsigned int flags) {
 	return ret;
 }
 
-int madvise(void *addr, size_t length, int advice) {
-	MLIBC_CHECK_OR_ENOSYS(mlibc::sys_madvise, -1);
-	if(int e = mlibc::sys_madvise(addr, length, advice)) {
-		errno = e;
-		return -1;
-	}
-
-	return 0;
-}
 
 int mincore(void *addr, size_t length, unsigned char *vec) {
 	MLIBC_CHECK_OR_ENOSYS(mlibc::sys_munlockall, -1);
