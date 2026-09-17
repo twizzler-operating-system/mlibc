@@ -24,6 +24,7 @@
 #include <stdlib.h>
 
 #include "../../options/linux/include/sys/sysinfo.h"
+#include <sys/stat.h>
 #include <twizzler/rt/object.h>
 #include <twizzler/rt/fd.h>
 #include <twizzler/rt/io.h>
@@ -246,6 +247,22 @@ int sys_anon_free(void *pointer, size_t size) {
 	return 0;
 }
 
+// twz_rt_get_sysinfo() is a sys_info syscall, and sysconf() is called often enough (and for
+// enough purely-constant values) that paying one per call is worth avoiding. Neither the CPU
+// count nor the page size changes over the life of a compartment, so read them once. Two threads
+// racing here both write the same bytes; the flag orders the read against the write that
+// published it.
+static struct system_info cached_sysinfo(void) {
+    static struct system_info info;
+    static unsigned char have_info;
+    if (__atomic_load_n(&have_info, __ATOMIC_ACQUIRE))
+        return info;
+    struct system_info fresh = twz_rt_get_sysinfo();
+    info = fresh;
+    __atomic_store_n(&have_info, 1, __ATOMIC_RELEASE);
+    return fresh;
+}
+
 int sys_fadvise(int fd, off_t offset, off_t length, int advice) {
     SYSTRACE("sys_fadvise(fd=%d, offset=%ld, length=%ld, advice=%d)", fd, offset, length, advice);
     // TODO
@@ -336,6 +353,112 @@ static void socket_prot_set(int fd, int type) {
     __atomic_store_n(&socket_prot_table[fd], v, __ATOMIC_RELAXED);
 }
 
+// Absolute path of each *directory* descriptor, for resolving the dirfd of the *at() calls.
+//
+// A dirfd cannot be honoured without knowing what it names: the runtime's name operations take a
+// path and nothing else, and the naming layer exposes no namespace-relative remove or rename to
+// hand a descriptor to (`enumerate_names_nsid` is the only id-relative call there is). The one
+// party that knows is whoever opened it, which is this libc.
+//
+// Resolving against the working directory instead would be wrong, not merely approximate: a
+// caller that uses a dirfd has, by definition, not chdir'd to it -- `rm /a/b/c` opens /a/b and
+// unlinks "c" from a working directory somewhere else entirely -- so "c" would name a different
+// file. Paths are stored absolute for the same reason: the process may chdir between the open and
+// the use. Only directories are recorded, since only a directory can be a dirfd.
+static char *fd_path_table[TWZ_MAX_TRACKED_FD];
+
+static void fd_path_clear(int fd) {
+    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
+        return;
+    char *old = __atomic_exchange_n(&fd_path_table[fd], (char *)nullptr, __ATOMIC_RELAXED);
+    if (old)
+        getAllocator().free(old);
+}
+
+static void fd_path_store(int fd, const char *path) {
+    if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD || !path)
+        return;
+    size_t len = strlen(path);
+    char *copy = (char *)getAllocator().allocate(len + 1);
+    // Best effort: a directory we failed to record is refused as a dirfd below, which is what
+    // every dirfd did before this table existed.
+    if (!copy)
+        return;
+    memcpy(copy, path, len + 1);
+    char *old = __atomic_exchange_n(&fd_path_table[fd], copy, __ATOMIC_RELAXED);
+    if (old)
+        getAllocator().free(old);
+}
+
+// A duplicate names the same directory as its original.
+static void fd_path_inherit(int newfd, int oldfd) {
+    if (oldfd < 0 || oldfd >= TWZ_MAX_TRACKED_FD)
+        return;
+    char *src = __atomic_load_n(&fd_path_table[oldfd], __ATOMIC_RELAXED);
+    if (src)
+        fd_path_store(newfd, src);
+}
+
+// Join `dir` and `path` into `buf`. `dir` is taken as-is; no component is normalised, because the
+// naming server resolves "." and ".." itself and is the only party that can do so correctly.
+static int path_join(const char *dir, const char *path, char *buf, size_t buflen) {
+    size_t dlen = strlen(dir);
+    while (dlen > 1 && dir[dlen - 1] == '/')
+        dlen--;
+    // The root already ends in the separator; anything else needs one.
+    bool sep = !(dlen == 1 && dir[0] == '/');
+    size_t plen = strlen(path);
+    if (dlen + (sep ? 1 : 0) + plen + 1 > buflen)
+        return ENAMETOOLONG;
+    memcpy(buf, dir, dlen);
+    if (sep)
+        buf[dlen++] = '/';
+    memcpy(buf + dlen, path, plen + 1);
+    return 0;
+}
+
+// Resolve an *at()-style (dirfd, path) pair into the single path the runtime's name calls take.
+// Absolute paths and AT_FDCWD pass straight through -- the runtime resolves those itself against
+// the working namespace. `*out` points either into `path` or into `buf`.
+static int at_resolve(int dirfd, const char *path, char *buf, size_t buflen, const char **out) {
+    if (!path)
+        return EFAULT;
+    if (path[0] == '/' || dirfd == AT_FDCWD) {
+        *out = path;
+        return 0;
+    }
+    if (dirfd < 0)
+        return EBADF;
+    const char *dir = (dirfd < TWZ_MAX_TRACKED_FD)
+        ? __atomic_load_n(&fd_path_table[dirfd], __ATOMIC_RELAXED)
+        : nullptr;
+    if (!dir) {
+        SYSTRACE("at_resolve: dirfd %d names no directory this libc opened", dirfd);
+        return ENOTSUP;
+    }
+    int e = path_join(dir, path, buf, buflen);
+    if (e)
+        return e;
+    *out = buf;
+    return 0;
+}
+
+// Record the directory `fd` names, making `path` absolute first.
+//
+// Deliberately its own function rather than a block inside sys_openat: the two PATH_MAX buffers
+// would otherwise sit in every open()'s frame, including the overwhelming majority that open a
+// file and can never be a dirfd. Here they cost a frame only on the directory opens that need it.
+__attribute__((noinline)) static void fd_path_record(int fd, const char *path) {
+    if (path[0] == '/') {
+        fd_path_store(fd, path);
+        return;
+    }
+    char cwd[PATH_MAX];
+    char abs[PATH_MAX];
+    if (sys_getcwd(cwd, sizeof(cwd)) == 0 && path_join(cwd, path, abs, sizeof(abs)) == 0)
+        fd_path_store(fd, abs);
+}
+
 // Drop every per-descriptor record, so a recycled descriptor does not inherit stale state.
 static void fd_state_clear(int fd) {
     if (fd < 0 || fd >= TWZ_MAX_TRACKED_FD)
@@ -343,6 +466,7 @@ static void fd_state_clear(int fd) {
     __atomic_store_n(&socket_prot_table[fd], TWZ_SOCK_PROT_NONE, __ATOMIC_RELAXED);
     __atomic_store_n(&socket_flags_table[fd], 0u, __ATOMIC_RELAXED);
     __atomic_store_n(&fd_openflags_table[fd], 0, __ATOMIC_RELAXED);
+    fd_path_clear(fd);
 }
 
 // Defaults to stream for descriptors we never saw go through sys_socket, which preserves the
@@ -393,10 +517,10 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
     SYSTRACE("sys_openat(dirfd=%d, path=%s, flags=%d, mode=%o, fd=%p)", dirfd, path, flags, mode, fd);
 
     (void)mode;
-    if (dirfd != AT_FDCWD) {
-        SYSTRACE("sys_openat: dirfd != AT_FDCWD");
-        mlibc::sys_libc_log("sys_openat: dirfd != AT_FDCWD");
-        return ENOSYS;
+    char at_buf[PATH_MAX];
+    if (int e = at_resolve(dirfd, path, at_buf, sizeof(at_buf), &path)) {
+        SYSTRACE("sys_openat returning %d (dirfd)", e);
+        return e;
     }
     struct create_options co = {
         .id = 0,
@@ -442,34 +566,38 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
         SYSTRACE("sys_openat: path length %ld exceeds NAME_DATA_MAX", path_len);
         return ENAMETOOLONG;
     }
-    struct open_info args = {
-        .create = co,
-        .flags = 0,
-        .len = path_len,
-        .name = {}
-    };
-    memcpy(&args.name, path, path_len + 1);
+    // Field-at-a-time, not an aggregate initializer: `.name = {}` makes the compiler zero all
+    // NAME_DATA_MAX bytes before the memcpy overwrites the front of them, which is a 2KB memset
+    // on every open (and so on every stat, access and opendir). The runtime reads name[0..len]
+    // and nothing past it (kinds.rs, OpenKind::Path).
+    struct open_info args;
+    args.create = co;
+    args.flags = 0;
+    args.len = path_len;
+    memcpy(args.name, path, path_len + 1);
     struct open_result res = twz_rt_fd_open(OpenKind_Path, open_flags, &args, sizeof(args));
     if (res.err != SUCCESS) {
         return twz_error_errno(res.err);
     }
 
+    // Fetched unconditionally now: as well as the O_DIRECTORY/O_NOFOLLOW checks below, the kind
+    // decides whether this descriptor can later be used as a dirfd and so needs its name kept.
+    struct fd_info info;
+    bool have_info = twz_rt_fd_get_info(res.fd, &info);
+
     // O_DIRECTORY and O_NOFOLLOW are both constraints on what we were allowed to open, and the
     // runtime resolves by name kind rather than checking them, so enforce them here.
-    if (flags & (O_DIRECTORY | O_NOFOLLOW)) {
-        struct fd_info info;
-        if (twz_rt_fd_get_info(res.fd, &info)) {
-            if ((flags & O_DIRECTORY) && info.kind != FdKind_Directory) {
-                twz_rt_fd_close(res.fd);
-                SYSTRACE("sys_openat returning ENOTDIR (O_DIRECTORY, kind=%d)", info.kind);
-                return ENOTDIR;
-            }
-            // O_PATH opens are allowed to name a symlink; ordinary ones are not.
-            if ((flags & O_NOFOLLOW) && !(flags & O_PATH) && info.kind == FdKind_SymLink) {
-                twz_rt_fd_close(res.fd);
-                SYSTRACE("sys_openat returning ELOOP (O_NOFOLLOW on a symlink)");
-                return ELOOP;
-            }
+    if (have_info && (flags & (O_DIRECTORY | O_NOFOLLOW))) {
+        if ((flags & O_DIRECTORY) && info.kind != FdKind_Directory) {
+            twz_rt_fd_close(res.fd);
+            SYSTRACE("sys_openat returning ENOTDIR (O_DIRECTORY, kind=%d)", info.kind);
+            return ENOTDIR;
+        }
+        // O_PATH opens are allowed to name a symlink; ordinary ones are not.
+        if ((flags & O_NOFOLLOW) && !(flags & O_PATH) && info.kind == FdKind_SymLink) {
+            twz_rt_fd_close(res.fd);
+            SYSTRACE("sys_openat returning ELOOP (O_NOFOLLOW on a symlink)");
+            return ELOOP;
         }
     }
 
@@ -483,6 +611,9 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
     fd_state_clear(res.fd);
     fd_openflags_set(res.fd, flags);
     fd_cloexec_set(res.fd, (flags & O_CLOEXEC) != 0);
+    // Only a directory can be a dirfd, so only a directory is worth the getcwd and the copy.
+    if (have_info && info.kind == FdKind_Directory)
+        fd_path_record(res.fd, path);
 
     if(fd) {
         *fd = res.fd;
@@ -557,6 +688,7 @@ int sys_fcntl(int fd, int cmd, va_list args, int *result) {
 			fd_state_clear(dup_fd);
 			fd_openflags_set(dup_fd, fd_openflags_get(fd));
 			socket_prot_set(dup_fd, socket_type_get(fd));
+			fd_path_inherit(dup_fd, fd);
 			fd_cloexec_set(dup_fd, cmd == F_DUPFD_CLOEXEC);
 			*result = dup_fd;
 			SYSTRACE("sys_fcntl(F_DUPFD) returning 0, newfd=%d", dup_fd);
@@ -658,6 +790,7 @@ int sys_dup2(int fd, int flags, int newfd) {
         fd_state_clear(newfd);
         fd_openflags_set(newfd, fd_openflags_get(fd));
         socket_prot_set(newfd, socket_type_get(fd));
+        fd_path_inherit(newfd, fd);
         fd_cloexec_set(newfd, (flags & O_CLOEXEC) != 0);
     }
 
@@ -797,9 +930,48 @@ int sys_fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int 
 
 int sys_utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags) {
     SYSTRACE("sys_utimensat(dirfd=%d, pathname=%s, times=%p, flags=%d)", dirfd, pathname, times, flags);
-	int result = ENOSYS;
-	SYSTRACE("sys_utimensat returning %d", result);
-	return result;
+    struct fd_set_times fst = { .accessed = NO_DURATION, .modified = NO_DURATION };
+    struct duration now = twz_rt_get_system_time();
+    for (int i = 0; i < 2; i++) {
+        struct option_duration *slot = (i == 0) ? &fst.accessed : &fst.modified;
+        long nsec = times ? times[i].tv_nsec : UTIME_NOW;
+        if (nsec == UTIME_OMIT)
+            continue;
+        if (nsec == UTIME_NOW) {
+            slot->dur = now;
+        } else {
+            slot->dur.seconds = (uint64_t)times[i].tv_sec;
+            slot->dur.nanos = (uint32_t)nsec;
+        }
+        slot->is_some = 1;
+    }
+
+    // futimens/futimes arrive as a NULL or AT_EMPTY_PATH-empty pathname: operate on dirfd
+    // itself. Otherwise open the target; sys_openat carries the dirfd policy (AT_FDCWD only).
+    bool on_fd = !pathname || (!pathname[0] && (flags & AT_EMPTY_PATH));
+    int fd = dirfd;
+    bool opened = false;
+    if (!on_fd) {
+        int oflags = O_WRONLY | ((flags & AT_SYMLINK_NOFOLLOW) ? O_NOFOLLOW : 0);
+        int e = sys_openat(dirfd, pathname, oflags, 0, &fd);
+        if (e == ELOOP && (flags & AT_SYMLINK_NOFOLLOW)) {
+            // The target is a symlink, and links keep no timestamps here: accept without effect
+            // so archive extraction restoring link times does not fail.
+            SYSTRACE("sys_utimensat returning 0 (symlink, accepted without effect)");
+            return 0;
+        }
+        if (e) {
+            SYSTRACE("sys_utimensat returning %d (open failed)", e);
+            return e;
+        }
+        opened = true;
+    }
+    twz_error err = twz_rt_fd_cmd(fd, FD_CMD_SET_TIMES, &fst, NULL);
+    int result = twz_error_errno(err);
+    if (opened)
+        sys_close(fd);
+    SYSTRACE("sys_utimensat returning %d", result);
+    return result;
 }
 
 // Object data begins one page in: object_handle::start is the base of the object, despite the
@@ -808,11 +980,7 @@ int sys_utimensat(int dirfd, const char *pathname, const struct timespec times[2
 #define TWZ_OBJ_DATA_OFF 0x1000
 
 // File-backed regions handed out by sys_vm_map, so sys_vm_unmap can release the right handle.
-//
-// Anonymous mappings are deliberately *not* recorded. They come from twz_rt_malloc, which this
-// libc's own allocator is built on, so allocating a record for one would re-enter the allocator.
-// Their existing leak on unmap is untouched by this code -- fixing it needs the allocator path
-// looked at as its own change, not a rider on this one.
+// Anonymous ones are tracked separately, in anon_maps below.
 #define TWZ_VM_MAX_MAPS 128
 static struct {
 	void *base;
@@ -862,6 +1030,74 @@ static bool vm_map_take(void *base, struct object_handle *out) {
 	}
 	vm_maps_release();
 	return false;
+}
+
+// Anonymous regions handed out by sys_vm_map, so sys_vm_unmap can hand the exact
+// (pointer, length) pair back to twz_rt_dealloc. The length has to come from here rather than
+// from the caller: the allocator can only free a block at the size it issued, and a caller
+// unmapping a sub-range must not be allowed to free the whole region.
+//
+// Recording one costs no allocation -- the table is static -- and this path is not the one this
+// libc's own allocator sits on. That allocator uses sys_anon_allocate/sys_anon_free, which already
+// round-trip through twz_rt_malloc/twz_rt_dealloc; nothing in malloc reaches sys_vm_map. Kept
+// separate from vm_maps so a program with many anonymous regions cannot starve file mappings of
+// slots.
+#define TWZ_ANON_MAX_MAPS 1024
+static struct {
+	void *base;
+	size_t len;
+} anon_maps[TWZ_ANON_MAX_MAPS];
+static unsigned char anon_maps_lock;
+static size_t anon_maps_hint;
+
+#define TWZ_ANON_NONE 0
+#define TWZ_ANON_FULL 1
+#define TWZ_ANON_PARTIAL 2
+
+static void anon_maps_acquire(void) {
+	while(__atomic_test_and_set(&anon_maps_lock, __ATOMIC_ACQUIRE))
+		;
+}
+
+static void anon_maps_release(void) {
+	__atomic_clear(&anon_maps_lock, __ATOMIC_RELEASE);
+}
+
+// A null base marks a free slot; a real mapping is never at address zero.
+static bool anon_map_record(void *base, size_t len) {
+	anon_maps_acquire();
+	for(size_t n = 0; n < TWZ_ANON_MAX_MAPS; n++) {
+		size_t i = (anon_maps_hint + n) % TWZ_ANON_MAX_MAPS;
+		if(!anon_maps[i].base) {
+			anon_maps[i].base = base;
+			anon_maps[i].len = len;
+			anon_maps_hint = (i + 1) % TWZ_ANON_MAX_MAPS;
+			anon_maps_release();
+			return true;
+		}
+	}
+	anon_maps_release();
+	return false;
+}
+
+// Takes the record starting exactly at `base`, if `size` covers all of it. A caller unmapping less
+// than the whole region gets TWZ_ANON_PARTIAL and the record is left in place.
+static int anon_map_take(void *base, size_t size, size_t *len_out) {
+	anon_maps_acquire();
+	for(size_t i = 0; i < TWZ_ANON_MAX_MAPS; i++) {
+		if(anon_maps[i].base != base)
+			continue;
+		if(size < anon_maps[i].len) {
+			anon_maps_release();
+			return TWZ_ANON_PARTIAL;
+		}
+		*len_out = anon_maps[i].len;
+		anon_maps[i].base = nullptr;
+		anon_maps_release();
+		return TWZ_ANON_FULL;
+	}
+	anon_maps_release();
+	return TWZ_ANON_NONE;
 }
 
 static map_flags twz_prot_to_map_flags(int prot) {
@@ -924,11 +1160,22 @@ int sys_vm_map(void *hint, size_t size, int prot, int flags,
 
 	if(fd != -1)
 		return ENOTSUP;
-	*window = twz_rt_malloc(size, 0x1000, ZERO_MEMORY);
-    if (*window == NULL) {
-        return ENOMEM;
-    }
-    return 0;
+	void *anon = twz_rt_malloc(size, 0x1000, ZERO_MEMORY);
+	if(anon == NULL)
+		return ENOMEM;
+	if(!anon_map_record(anon, size)) {
+		// Table full. Keep the mapping and leak it rather than fail an allocation the caller may
+		// have no way to recover from -- that is the old behaviour, now bounded and announced
+		// rather than universal and silent. Warned once: a program that hits this hits it often.
+		static unsigned char warned;
+		if(!__atomic_test_and_set(&warned, __ATOMIC_RELAXED))
+			mlibc::infoLogger() << "mlibc: " << TWZ_ANON_MAX_MAPS
+			                    << " anonymous mappings live; further ones will leak on munmap"
+			                    << frg::endlog;
+	}
+	*window = anon;
+	SYSTRACE("sys_vm_map returning 0, window=%p (anonymous, %ld bytes)", *window, size);
+	return 0;
 	/*
 	if(offset % 4096)
 		return EINVAL;
@@ -956,13 +1203,26 @@ int sys_vm_unmap(void *pointer, size_t size) {
 		SYSTRACE("sys_vm_unmap returning 0 (released object mapping)");
 		return 0;
 	}
-	// Anonymous mappings are not tracked (see vm_maps), so this still returns success having
-	// freed nothing for them -- every such mapping leaks, as it did before this change. Left
-	// alone deliberately: the anonymous path is what mlibc's own allocator sits on, and undoing
-	// it belongs in a change that can be tested against the allocator rather than beside it.
-	int result = 0;
-	SYSTRACE("sys_vm_unmap returning %d (untracked region, nothing released)", result);
-	return result;
+	size_t len;
+	switch(anon_map_take(pointer, size, &len)) {
+		case TWZ_ANON_FULL:
+			// The length recorded at map time, not the caller's: the allocator can only free a
+			// block at the size it issued.
+			twz_rt_dealloc(pointer, len, 0x1000, 0);
+			SYSTRACE("sys_vm_unmap returning 0 (freed anonymous region of %ld bytes)", len);
+			return 0;
+		case TWZ_ANON_PARTIAL:
+			// POSIX would drop the leading `size` bytes and keep the rest. One region is one
+			// allocation and cannot be split, so nothing is freed and the record stays: the caller
+			// keeps memory it asked to release, where freeing the whole region would be a
+			// use-after-free of the part it still holds.
+			SYSTRACE("sys_vm_unmap returning 0 (partial unmap, nothing freed)");
+			return 0;
+	}
+	// Not a region this libc handed out: a sub-range of one (the base does not match), or a
+	// mapping that predates the tracking. Nothing to release.
+	SYSTRACE("sys_vm_unmap returning 0 (untracked region, nothing released)");
+	return 0;
 }
 
 int sys_vm_protect(void *pointer, size_t size, int prot) {
@@ -1128,7 +1388,9 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat
             default:               statbuf->st_mode = S_IFREG | 0777; break;
         }
     }
-    statbuf->st_nlink = 1;
+    // The runtime reports 0 when it does not track a link count for this kind of file; every file
+    // that exists has at least one name.
+    statbuf->st_nlink = info.nlink ? info.nlink : 1;
     statbuf->st_size = info.len;
     statbuf->st_blksize = 0x1000;
     statbuf->st_blocks = (blkcnt_t)((info.len + 511) / 512);
@@ -1258,6 +1520,14 @@ int sigDeliver(int sig) {
 	} else {
 		reinterpret_cast<void (*)(int)>(handler)(sig);
 	}
+	// A blocking call is interrupted only when a handler was actually *caught* and SA_RESTART is
+	// clear -- an ignored signal, or one whose handler restarts, must leave the call alone. The
+	// runtime owns the mechanism (a per-thread generation word that blocking calls sample and
+	// sleep on) but not the handler table, so this is the only place that knows which case
+	// applies. Reached here only when a real handler ran: SIG_DFL, SIG_IGN and blocked-and-queued
+	// all returned above.
+	if(!(flags & SA_RESTART))
+		twz_rt_interrupt_bump();
 	// POSIX restores the mask the handler ran under when it returns.
 	__atomic_store_n(&sigBlocked, saved, __ATOMIC_RELEASE);
 	return MLIBC_SIGNAL_HANDLED;
@@ -1661,15 +1931,27 @@ int sys_getcwd(char *buf, size_t size) {
     if (!buf) {
         return EFAULT;
     }
-    // There is no per-process cwd yet (sys_chdir is ENOSYS), so this is always the root.
-    // A real implementation would track it via the NameRoot_Current nameroot.
-    if (size < 2) {
-        SYSTRACE("sys_getcwd returning ERANGE (size=%ld)", size);
+    if (size == 0) {
+        return EINVAL;
+    }
+    // The working directory is per-handle state on the naming server, and NameRoot_Current is
+    // the runtime's window onto it. This used to answer "/" unconditionally, which was only ever
+    // right for a process that had not moved: libstd reads the same nameroot and would disagree
+    // with getcwd() in the same process the moment anything called chdir().
+    struct io_result res = twz_rt_get_nameroot(NameRoot_Current, buf, size);
+    if (res.err != SUCCESS) {
+        SYSTRACE("sys_getcwd returning %d", twz_error_errno(res.err));
+        return twz_error_errno(res.err);
+    }
+    // A short write is how the runtime reports truncation, so a result that fills the buffer
+    // exactly cannot be told apart from a longer path -- and either way there is no room for the
+    // terminator. Both are ERANGE, which is getcwd's contract: the path plus NUL must fit.
+    if (res.val >= size) {
+        SYSTRACE("sys_getcwd returning ERANGE (size=%ld, need > %ld)", size, res.val);
         return ERANGE;
     }
-    buf[0] = '/';
-    buf[1] = '\0';
-    SYSTRACE("sys_getcwd returning 0");
+    buf[res.val] = '\0';
+    SYSTRACE("sys_getcwd returning 0 (cwd=%s)", buf);
     return 0;
 }
 
@@ -1680,16 +1962,13 @@ int sys_unlinkat(int dfd, const char *path, int flags) {
         return EFAULT;
     }
     
-    size_t path_len = strlen(path);
-    
-    // Twizzler's twz_rt_fd_remove doesn't support dirfd semantics the same way POSIX does.
-    // For now, we require AT_FDCWD and handle the path as absolute/relative from root.
-    if (dfd != AT_FDCWD && dfd >= 0) {
-        // Would need to construct a path relative to dfd, which Twizzler doesn't directly support
-        mlibc::sys_libc_log("sys_unlinkat: relative paths via dirfd not supported");
-        return ENOTSUP;
+    char at_buf[PATH_MAX];
+    if (int e = at_resolve(dfd, path, at_buf, sizeof(at_buf), &path)) {
+        SYSTRACE("sys_unlinkat returning %d (dirfd)", e);
+        return e;
     }
-    
+    size_t path_len = strlen(path);
+
     twz_error err = twz_rt_fd_remove(path, path_len);
     int result = twz_error_errno(err);
     
@@ -2147,7 +2426,7 @@ int sys_sysinfo(struct sysinfo *info) {
     SYSTRACE("sys_sysinfo(info=%p)", info);
     if (!info)
         return EFAULT;
-    struct system_info si = twz_rt_get_sysinfo();
+    struct system_info si = cached_sysinfo();
     struct duration uptime = twz_rt_get_monotonic_time();
     memset(info, 0, sizeof(*info));
     info->uptime = (long)uptime.seconds;
@@ -2239,10 +2518,31 @@ extern "C" const char __mlibc_syscall_end[1];
 
 int sys_tgkill(int tgid, int tid, int sig) {
     SYSTRACE("sys_tgkill(tgid=%d, tid=%d, sig=%d)", tgid, tid, sig);
-	// Delivery is compartment-wide, so there is no thread to select: pthread_kill() against any
-	// thread of this process raises the signal against the process.
-	(void)tid;
-	int result = sys_kill(tgid, sig);
+	// A thread id only names a thread within its own process, and there is no way to reach
+	// another process's threads.
+	if(tgid != sys_getpid()) {
+		SYSTRACE("sys_tgkill returning ESRCH (not this process)");
+		return ESRCH;
+	}
+	if(sig != 0 && !sigValid(sig))
+		return EINVAL;
+	// Self stays synchronous, for the same reason sys_kill dispatches self-directed signals
+	// inline: raise()/abort() must take effect before returning, and posting would only queue an
+	// upcall for the next return to user.
+	if(tid == sys_gettid()) {
+		if(sig != 0)
+			sigRaiseSelf(sig);
+		SYSTRACE("sys_tgkill returning 0 (self)");
+		return 0;
+	}
+	if(sig == 0) {
+		// Existence probe; nothing to post.
+		return 0;
+	}
+	// Posted against that thread specifically: its handler runs there, and the kernel wakes it out
+	// of a blocking wait so it reaches a delivery point. This used to `(void)tid` and raise
+	// against the caller, which ran the handler on the wrong thread and returned 0 while doing it.
+	int result = twz_error_errno(twz_rt_thread_signal((thread_id)tid, (uint64_t)sig));
 	SYSTRACE("sys_tgkill returning %d", result);
 	return result;
 }
@@ -2282,32 +2582,37 @@ int sys_tcflow(int fd, int action) {
 	return result;
 }
 
+// Does a name resolve? Opening the path would answer this too, but at a much higher price: an
+// open resolves the name *and* maps the object, faults in its meta page (a pager round trip on a
+// cold object), takes a descriptor slot, and then unmaps it all again on close.
+// twz_rt_resolve_name is the name lookup on its own, with the same follow-symlink behavior an
+// open would have. There is no permission model behind the mode bits -- the runtime reports rwx
+// for every file and sys_chmod is accepted without effect -- so existence is the whole question.
+static int name_exists(const char *path) {
+    if (!path)
+        return EFAULT;
+    struct objid_result res = twz_rt_resolve_name(NameResolver_Default, path, strlen(path));
+    return twz_error_errno(res.err);
+}
+
 int sys_access(const char *path, int mode) {
     SYSTRACE("sys_access(path=%s, mode=%d)", path, mode);
-    int fd;
-    int e = sys_open(path, O_RDONLY, 0, &fd);
-    if (e != 0) {
-        SYSTRACE("sys_access returning %d (open failed)", e);
-        return e;
-    }
-    twz_rt_fd_close(fd);
-    SYSTRACE("sys_access returning 0");
-	return 0;
+    int result = name_exists(path);
+    SYSTRACE("sys_access returning %d", result);
+	return result;
 }
 
 int sys_faccessat(int dirfd, const char *pathname, int mode, int flags) {
     SYSTRACE("sys_faccessat(dirfd=%d, pathname=%s, mode=%d, flags=%d)", dirfd, pathname, mode, flags);
 
-    int fd = -1;
-    // sys_openat reports a positive errno, so this must not test for e < 0.
-    int e = sys_openat(dirfd, pathname, O_RDONLY, 0, &fd);
-    if (e != 0) {
-        SYSTRACE("sys_faccessat returning %d (open failed)", e);
+    char at_buf[PATH_MAX];
+    if (int e = at_resolve(dirfd, pathname, at_buf, sizeof(at_buf), &pathname)) {
+        SYSTRACE("sys_faccessat returning %d (dirfd)", e);
         return e;
     }
-    twz_rt_fd_close(fd);
-    SYSTRACE("sys_faccessat returning 0");
-	return 0;
+    int result = name_exists(pathname);
+    SYSTRACE("sys_faccessat returning %d", result);
+	return result;
 }
 
 int sys_accept(int fd, int *newfd, struct sockaddr *addr_ptr, socklen_t *addr_length, int flags) {
@@ -2657,64 +2962,81 @@ int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_re
 		return errno;
 	}
 	size_t dirent_size = offsetof(struct dirent, d_name);
-	// struct name_entry is ~350 bytes, so sizing this batch off the caller's buffer would put
-	// an order of magnitude more than max_size on the stack. Cap it and let the caller loop.
+	// struct name_entry is ~350 bytes, so sizing this batch off the caller's buffer would put an
+	// order of magnitude more than max_size on the stack. Cap the batch -- but refill it in a
+	// loop rather than returning after one, because each batch is a call into the naming service
+	// and readdir() always hands us a 2048-byte buffer, which holds around four batches' worth of
+	// dirents. Returning after the first made ls of a large directory pay four times the gate
+	// calls, and a pair of lseeks for each one.
 	static const size_t max_batch = 16;
-	size_t nr_twz_entries = max_size / dirent_size;
-	if(nr_twz_entries > max_batch)
-		nr_twz_entries = max_batch;
-	if(nr_twz_entries == 0)
-		nr_twz_entries = 1;
-	SYSTRACE("sys_read_entries(handle=%d, buffer=%p, max_size=%ld, bytes_read=%p), off=%ld, nr_twz_entries=%ld",
-		handle, buffer, max_size, bytes_read, off, nr_twz_entries);
-
 	struct name_entry twznames[max_batch];
-	struct io_result res = twz_rt_fd_enumerate_names(handle, twznames, nr_twz_entries, off / sizeof(struct name_entry));
-	if(res.err != 0)
-		return twz_error_errno(res.err);
+	SYSTRACE("sys_read_entries(handle=%d, buffer=%p, max_size=%ld, bytes_read=%p), off=%ld",
+		handle, buffer, max_size, bytes_read, off);
 
-	SYSTRACE("twz_rt_fd_enumerate_names returned %ld entries", res.val);
-	if(res.val == 0)
-		return 0;
+	size_t base_index = (size_t)off / sizeof(struct name_entry);
+	size_t count = 0;
+	bool full = false;
 
-	// it's null terminated
-	if(twznames[0].name_len + 1 + dirent_size > max_size)
-		return EINVAL;
-
-    size_t count = 0;
-	for(size_t i = 0;i < res.val;i++) {
-		struct name_entry *entry = &twznames[i];
-		if(entry->name_len + 1 + dirent_size + *bytes_read > max_size)
-			break;
-
-		size_t thislen = dirent_size + 1 + entry->name_len;
-		size_t this_reclen = ALIGN_UP(thislen, 8);
-		struct dirent *target = (struct dirent *)((char *)buffer + *bytes_read);
-		target->d_ino = objid_to_ino(entry->info.id);
-		target->d_reclen = this_reclen;
-		SYSTRACE("entry %ld: name=%.*s, ino=%ld, reclen=%hu, namelen=%d, direntsz = %ld, direntaln = %ld, thislen=%d", i, entry->name_len, entry->name, target->d_ino, target->d_reclen, entry->name_len, dirent_size, thislen, 8);
-
-		char type = DT_UNKNOWN;
-		switch(entry->info.kind) {
-			case FdKind_Regular:
-				type = DT_REG;
+	while(!full) {
+		size_t nr_twz_entries = (max_size - *bytes_read) / dirent_size;
+		if(nr_twz_entries > max_batch)
+			nr_twz_entries = max_batch;
+		if(nr_twz_entries == 0) {
+			// Out of room. Only worth another fetch if we have produced nothing at all, where a
+			// max_size too small for even one entry has to report EINVAL rather than end-of-list.
+			if(count > 0)
 				break;
-			case FdKind_Directory:
-				type = DT_DIR;
-				break;
-			case FdKind_SymLink:
-				type = DT_LNK;
-				break;
-			default: break;
+			nr_twz_entries = 1;
 		}
 
-		target->d_type = type;
-		target->d_off = this_reclen + *bytes_read;
-		memcpy(target->d_name, entry->name, entry->name_len);
-		target->d_name[entry->name_len] = 0;
+		struct io_result res = twz_rt_fd_enumerate_names(handle, twznames, nr_twz_entries,
+			base_index + count);
+		if(res.err != 0)
+			return twz_error_errno(res.err);
 
-		*bytes_read += this_reclen;
-        count += 1;
+		SYSTRACE("twz_rt_fd_enumerate_names returned %ld entries", res.val);
+		if(res.val == 0)
+			break;
+
+		for(size_t i = 0;i < res.val;i++) {
+			struct name_entry *entry = &twznames[i];
+			if(entry->name_len + 1 + dirent_size + *bytes_read > max_size) {
+				// it's null terminated
+				if(count == 0)
+					return EINVAL;
+				full = true;
+				break;
+			}
+
+			size_t thislen = dirent_size + 1 + entry->name_len;
+			size_t this_reclen = ALIGN_UP(thislen, 8);
+			struct dirent *target = (struct dirent *)((char *)buffer + *bytes_read);
+			target->d_ino = objid_to_ino(entry->info.id);
+			target->d_reclen = this_reclen;
+			SYSTRACE("entry %ld: name=%.*s, ino=%ld, reclen=%hu, namelen=%d, direntsz = %ld, direntaln = %ld, thislen=%d", i, entry->name_len, entry->name, target->d_ino, target->d_reclen, entry->name_len, dirent_size, thislen, 8);
+
+			char type = DT_UNKNOWN;
+			switch(entry->info.kind) {
+				case FdKind_Regular:
+					type = DT_REG;
+					break;
+				case FdKind_Directory:
+					type = DT_DIR;
+					break;
+				case FdKind_SymLink:
+					type = DT_LNK;
+					break;
+				default: break;
+			}
+
+			target->d_type = type;
+			target->d_off = this_reclen + *bytes_read;
+			memcpy(target->d_name, entry->name, entry->name_len);
+			target->d_name[entry->name_len] = 0;
+
+			*bytes_read += this_reclen;
+			count += 1;
+		}
 	}
 	SYSTRACE("total bytes read: %ld (%ld entries)", *bytes_read, count);
 
@@ -2870,14 +3192,13 @@ int sys_sysconf(int num, long *ret) {
     SYSTRACE("sys_sysconf(num=%d, ret=%p)", num, ret);
     if (!ret)
         return EFAULT;
-    struct system_info info = twz_rt_get_sysinfo();
-	switch(num) {
+    switch(num) {
     	case _SC_NPROCESSORS_CONF:
     	case _SC_NPROCESSORS_ONLN:
-            *ret = info.available_parallelism;
+            *ret = cached_sysinfo().available_parallelism;
             break;
         case _SC_PAGESIZE:
-            *ret = info.page_size;
+            *ret = cached_sysinfo().page_size;
             break;
         // Limits. These mirror the values reported elsewhere in this file, so callers that
         // size buffers from sysconf agree with what the rest of the libc enforces.
@@ -3150,9 +3471,10 @@ int sys_mkdir(const char *path, mode_t mode) {
 
 int sys_mkdirat(int dirfd, const char *path, mode_t mode) {
     SYSTRACE("sys_mkdirat(dirfd=%d, path=%s, mode=%o)", dirfd, path, mode);
-    if (dirfd != AT_FDCWD) {
-        mlibc::sys_libc_log("sys_mkdirat: relative dirfd not supported");
-        return ENOSYS;
+    char at_buf[PATH_MAX];
+    if (int e = at_resolve(dirfd, path, at_buf, sizeof(at_buf), &path)) {
+        SYSTRACE("sys_mkdirat returning %d (dirfd)", e);
+        return e;
     }
     twz_error err = twz_rt_fd_mkns(path, strlen(path));
     int result = twz_error_errno(err);
@@ -3190,14 +3512,29 @@ int sys_umask(mode_t mode, mode_t *old) {
 
 int sys_chdir(const char *path) {
     SYSTRACE("sys_chdir(path=%s)", path);
-	int result = ENOSYS;
+	if (!path)
+		return EFAULT;
+	// Setting NameRoot_Current *is* chdir: the working namespace is the naming server's own
+	// per-handle state, so it performs the walk (and rejects a path that is missing or is not a
+	// namespace) rather than this libc joining strings and hoping.
+	twz_error err = twz_rt_set_nameroot(NameRoot_Current, path, strlen(path));
+	int result = twz_error_errno(err);
 	SYSTRACE("sys_chdir returning %d", result);
 	return result;
 }
 
 int sys_fchdir(int fd) {
     SYSTRACE("sys_fchdir(fd=%d)", fd);
-	int result = ENOSYS;
+	// Only reachable for a directory this libc opened, which is the only kind of descriptor
+	// fchdir() is defined on anyway.
+	const char *dir = (fd >= 0 && fd < TWZ_MAX_TRACKED_FD)
+		? __atomic_load_n(&fd_path_table[fd], __ATOMIC_RELAXED)
+		: nullptr;
+	if (!dir) {
+		SYSTRACE("sys_fchdir returning EBADF");
+		return EBADF;
+	}
+	int result = sys_chdir(dir);
 	SYSTRACE("sys_fchdir returning %d", result);
 	return result;
 }
@@ -3330,6 +3667,7 @@ int sys_dup(int fd, int flags, int *newfd) {
 		fd_state_clear(dup_fd);
 		fd_openflags_set(dup_fd, fd_openflags_get(fd));
 		socket_prot_set(dup_fd, socket_type_get(fd));
+		fd_path_inherit(dup_fd, fd);
 		fd_cloexec_set(dup_fd, (flags & O_CLOEXEC) != 0);
 		*newfd = dup_fd;
 	}
@@ -3433,11 +3771,42 @@ int sys_symlink(const char *target_path, const char *link_path) {
     return result;
 }
 
+int sys_link(const char *old_path, const char *new_path) {
+    SYSTRACE("sys_link(old_path=%s, new_path=%s)", old_path, new_path);
+    if (!old_path || !new_path)
+        return EFAULT;
+    // Argument order flips: link() names the existing file first, twz_rt_fd_link names the link
+    // being created first, matching twz_rt_fd_symlink.
+    twz_error err = twz_rt_fd_link(new_path, strlen(new_path), old_path, strlen(old_path));
+    int result = twz_error_errno(err);
+    SYSTRACE("sys_link returning %d", result);
+    return result;
+}
+
+int sys_linkat(int olddirfd, const char *old_path, int newdirfd, const char *new_path, int flags) {
+    SYSTRACE("sys_linkat(olddirfd=%d, old_path=%s, newdirfd=%d, new_path=%s, flags=%d)",
+        olddirfd, old_path, newdirfd, new_path, flags);
+    char old_buf[PATH_MAX], new_buf[PATH_MAX];
+    if (int e = at_resolve(olddirfd, old_path, old_buf, sizeof(old_buf), &old_path)) {
+        SYSTRACE("sys_linkat returning %d (olddirfd)", e);
+        return e;
+    }
+    if (int e = at_resolve(newdirfd, new_path, new_buf, sizeof(new_buf), &new_path)) {
+        SYSTRACE("sys_linkat returning %d (newdirfd)", e);
+        return e;
+    }
+    // AT_SYMLINK_FOLLOW is not honoured, and does not need to be: the naming layer cannot bind a
+    // second name to a symlink at all, so an old_path that is one fails with EINVAL either way
+    // rather than silently linking the wrong file.
+    return sys_link(old_path, new_path);
+}
+
 int sys_symlinkat(const char *target_path, int dirfd, const char *link_path) {
     SYSTRACE("sys_symlinkat(target_path=%s, dirfd=%d, link_path=%s)", target_path, dirfd, link_path);
-    if (dirfd != AT_FDCWD) {
-        SYSTRACE("sys_symlinkat: relative dirfd not supported");
-        return ENOSYS;
+    char at_buf[PATH_MAX];
+    if (int e = at_resolve(dirfd, link_path, at_buf, sizeof(at_buf), &link_path)) {
+        SYSTRACE("sys_symlinkat returning %d (dirfd)", e);
+        return e;
     }
     return sys_symlink(target_path, link_path);
 }
@@ -3445,9 +3814,10 @@ int sys_symlinkat(const char *target_path, int dirfd, const char *link_path) {
 int sys_readlinkat(int dirfd, const char *path, void *buffer, size_t max_size, ssize_t *length) {
     SYSTRACE("sys_readlinkat(dirfd=%d, path=%s, buffer=%p, max_size=%ld, length=%p)",
         dirfd, path, buffer, max_size, length);
-    if (dirfd != AT_FDCWD) {
-        SYSTRACE("sys_readlinkat: relative dirfd not supported");
-        return ENOSYS;
+    char at_buf[PATH_MAX];
+    if (int e = at_resolve(dirfd, path, at_buf, sizeof(at_buf), &path)) {
+        SYSTRACE("sys_readlinkat returning %d (dirfd)", e);
+        return e;
     }
     return sys_readlink(path, buffer, max_size, length);
 }
@@ -3455,9 +3825,14 @@ int sys_readlinkat(int dirfd, const char *path, void *buffer, size_t max_size, s
 int sys_renameat(int old_dirfd, const char *old_path, int new_dirfd, const char *new_path) {
     SYSTRACE("sys_renameat(old_dirfd=%d, old_path=%s, new_dirfd=%d, new_path=%s)",
         old_dirfd, old_path, new_dirfd, new_path);
-    if (old_dirfd != AT_FDCWD || new_dirfd != AT_FDCWD) {
-        SYSTRACE("sys_renameat: relative dirfd not supported");
-        return ENOSYS;
+    char old_buf[PATH_MAX], new_buf[PATH_MAX];
+    if (int e = at_resolve(old_dirfd, old_path, old_buf, sizeof(old_buf), &old_path)) {
+        SYSTRACE("sys_renameat returning %d (old_dirfd)", e);
+        return e;
+    }
+    if (int e = at_resolve(new_dirfd, new_path, new_buf, sizeof(new_buf), &new_path)) {
+        SYSTRACE("sys_renameat returning %d (new_dirfd)", e);
+        return e;
     }
     return sys_rename(old_path, new_path);
 }
@@ -3552,7 +3927,7 @@ int sys_fallocate(int fd, off_t offset, size_t size) {
 // ---------------------------------------------------------------------------
 
 static void fill_statvfs(struct statvfs *out) {
-    struct system_info si = twz_rt_get_sysinfo();
+    struct system_info si = cached_sysinfo();
     memset(out, 0, sizeof(*out));
     out->f_bsize = si.page_size;
     out->f_frsize = si.page_size;
@@ -3563,14 +3938,13 @@ int sys_statvfs(const char *path, struct statvfs *out) {
     SYSTRACE("sys_statvfs(path=%s, out=%p)", path, out);
     if (!path || !out)
         return EFAULT;
-    // Report per-path errors (e.g. ENOENT) the way a real statvfs would.
-    int fd = -1;
-    int e = sys_open(path, O_RDONLY, 0, &fd);
+    // Report per-path errors (e.g. ENOENT) the way a real statvfs would. Nothing here needs the
+    // file itself, so resolve the name rather than opening (and mapping) it.
+    int e = name_exists(path);
     if (e != 0) {
-        SYSTRACE("sys_statvfs returning %d (open failed)", e);
+        SYSTRACE("sys_statvfs returning %d (name lookup failed)", e);
         return e;
     }
-    twz_rt_fd_close(fd);
     fill_statvfs(out);
     SYSTRACE("sys_statvfs returning 0");
     return 0;
@@ -3776,7 +4150,7 @@ static int fill_all_cpus(size_t cpusetsize, cpu_set_t *mask) {
     if (cpusetsize < sizeof(__cpu_mask) || (cpusetsize % sizeof(__cpu_mask)) != 0)
         return EINVAL;
 
-    struct system_info si = twz_rt_get_sysinfo();
+    struct system_info si = cached_sysinfo();
     size_t ncpus = si.available_parallelism ? si.available_parallelism : 1;
     size_t setbits = cpusetsize * 8;
     if (ncpus > setbits)

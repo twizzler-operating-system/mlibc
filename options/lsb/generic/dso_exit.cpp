@@ -86,5 +86,10 @@ void __mlibc_do_finalize() {
 	// __cxa_finalize from here.
 #if !defined(__Twizzler__)
 	__dlapi_exit();
+#else
+	// Twizzler links against dynlink/monitor rather than mlibc's rtld, so there is no
+	// __dlapi_exit() to walk fini_array. Run at least libc's own destructors directly;
+	// without this the stdio guard never flushes, and buffered output is lost at exit.
+	__mlibc_do_destructors();
 #endif
 }

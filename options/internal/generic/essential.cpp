@@ -208,8 +208,22 @@ void *memmove(void *dest, const void *src, size_t size) {
 }
 
 size_t strlen(const char *s) {
-	size_t len = 0;
-	for(size_t i = 0; s[i]; i++)
-		len++;
-	return len;
+	// Byte-wise until 8-byte aligned (page-safe), then word-wise. An 8-aligned 8-byte load lies
+	// entirely within one 4 KiB page, so it never reads into an unmapped successor page past the
+	// terminator -- the reason a length-unknown scan cannot simply read unaligned words.
+	const char *p = s;
+	while(reinterpret_cast<uintptr_t>(p) & 7) {
+		if(!*p)
+			return static_cast<size_t>(p - s);
+		p++;
+	}
+	for(;;) {
+		uint64_t w;
+		__builtin_memcpy(&w, p, 8);
+		// Nonzero iff w contains a zero byte; the lowest zero byte is the lowest set bit.
+		uint64_t z = (w - 0x0101010101010101ull) & ~w & 0x8080808080808080ull;
+		if(z)
+			return static_cast<size_t>(p - s) + (__builtin_ctzll(z) >> 3);
+		p += 8;
+	}
 }

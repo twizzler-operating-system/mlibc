@@ -148,6 +148,8 @@ struct fd_info {
   struct duration accessed;
   struct duration modified;
   uint32_t unix_mode;
+  /// Number of names bound to the underlying object, or 0 if the runtime does not track it.
+  uint32_t nlink;
 };
 /// Get information about a descriptor. If this returns true, the fd was valid
 /// and the data pointed to by info is filled with fd_info data.
@@ -176,6 +178,15 @@ const fd_cmd FD_CMD_GET_CLOEXEC = 5;
 /// Set or clear the close-on-exec flag. The arg argument points to a uint32_t, non-zero to set.
 /// A descriptor produced by FD_CMD_DUP or FD_CMD_DUP2 always starts with the flag clear.
 const fd_cmd FD_CMD_SET_CLOEXEC = 6;
+/// Set file timestamps (utimensat). The arg argument points to a struct fd_set_times; a field
+/// with is_some clear is left unchanged. The ret argument is ignored.
+const fd_cmd FD_CMD_SET_TIMES = 7;
+
+/// Argument for FD_CMD_SET_TIMES. Times are seconds/nanos since the epoch.
+struct fd_set_times {
+  struct option_duration accessed;
+  struct option_duration modified;
+};
 
 /// Perform a command on the descriptor. The arguments arg and ret are interpreted according to
 /// the command specified.
@@ -213,6 +224,11 @@ extern twz_error twz_rt_fd_mkns(const char *name, size_t name_len);
 
 /// Create a new symlink.
 extern twz_error twz_rt_fd_symlink(const char *name, size_t name_len, const char *target, size_t target_len);
+
+/// Create a new hard link: bind name to the object that target already names. Fails if name
+/// exists, if target is not an object (a namespace or a symlink), or if the two names are in
+/// namespaces backed by different stores.
+extern twz_error twz_rt_fd_link(const char *name, size_t name_len, const char *target, size_t target_len);
 
 /// Rename a name in the namespace.
 extern twz_error twz_rt_fd_rename(const char *old_name, size_t old_name_len, const char *new_name, size_t new_name_len);

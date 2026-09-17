@@ -340,28 +340,138 @@ void qsort(void *base, size_t count, size_t size,
 	return qsort_r(base, count, size, qsort_callback, (void *) compare);
 }
 
+// MLIBC_QSORT_BEGIN -- introsort; kept between markers so the host fuzz harness compiles these
+// exact bytes rather than a copy that can drift from them.
+namespace {
+
+using sort_cmp = int (*)(const void *, const void *, void *);
+
+// Swap `size` bytes. Word-wise when both operands and the size allow it: sort elements are almost
+// always pointers or pointer-sized structs, where a byte loop costs several times what this does.
+void sort_swap(char *a, char *b, size_t size) {
+	if(a == b)
+		return;
+	if(!(size % sizeof(unsigned long))
+			&& !((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(b))
+					% alignof(unsigned long))) {
+		auto au = reinterpret_cast<unsigned long *>(a);
+		auto bu = reinterpret_cast<unsigned long *>(b);
+		for(size_t i = size / sizeof(unsigned long); i; i--, au++, bu++) {
+			unsigned long t = *au;
+			*au = *bu;
+			*bu = t;
+		}
+		return;
+	}
+	for(size_t i = 0; i < size; i++) {
+		char t = a[i];
+		a[i] = b[i];
+		b[i] = t;
+	}
+}
+
+void sort_insertion(char *base, size_t count, size_t size, sort_cmp compare, void *arg) {
+	for(size_t i = 1; i < count; i++)
+		for(size_t j = i; j && compare(base + j * size, base + (j - 1) * size, arg) < 0; j--)
+			sort_swap(base + j * size, base + (j - 1) * size, size);
+}
+
+void sort_sift(char *base, size_t root, size_t count, size_t size, sort_cmp compare, void *arg) {
+	for(;;) {
+		size_t child = 2 * root + 1;
+		if(child >= count)
+			return;
+		if(child + 1 < count && compare(base + child * size, base + (child + 1) * size, arg) < 0)
+			child++;
+		if(compare(base + root * size, base + child * size, arg) >= 0)
+			return;
+		sort_swap(base + root * size, base + child * size, size);
+		root = child;
+	}
+}
+
+// The depth-limit fallback. Quicksort on its own is quadratic on ordered and on adversarial input,
+// which is exactly the case a libc must not lose on.
+void sort_heap(char *base, size_t count, size_t size, sort_cmp compare, void *arg) {
+	if(count < 2)
+		return;
+	for(size_t i = count / 2; i; i--)
+		sort_sift(base, i - 1, count, size, compare, arg);
+	for(size_t i = count; i > 1; i--) {
+		sort_swap(base, base + (i - 1) * size, size);
+		sort_sift(base, 0, i - 1, size, compare, arg);
+	}
+}
+
+void sort_intro(char *base, size_t count, size_t size, sort_cmp compare, void *arg,
+		unsigned depth) {
+	const size_t threshold = 12;
+	while(count > threshold) {
+		if(!depth) {
+			sort_heap(base, count, size, compare, arg);
+			return;
+		}
+		depth--;
+
+		// Median of first/middle/last moved to index 0, where the partition below uses it in
+		// place as its sentinel. Holding the pivot in place rather than copying it avoids needing
+		// a scratch buffer whose size is only known at run time.
+		char *first = base;
+		char *mid = base + (count / 2) * size;
+		char *last = base + (count - 1) * size;
+		if(compare(mid, first, arg) < 0)
+			sort_swap(mid, first, size);
+		if(compare(last, mid, arg) < 0) {
+			sort_swap(last, mid, size);
+			if(compare(mid, first, arg) < 0)
+				sort_swap(mid, first, size);
+		}
+		sort_swap(first, mid, size);
+
+		size_t i = 0, j = count;
+		for(;;) {
+			// Both scans are bounded rather than relying on the pivot to stop them. A comparator
+			// that is not a strict weak ordering is a caller bug, but it must not turn into an
+			// out-of-bounds walk here -- the sort it replaces could not do that.
+			do
+				i++;
+			while(i < count && compare(base + i * size, base, arg) < 0);
+			do
+				j--;
+			while(j && compare(base + j * size, base, arg) > 0);
+			if(i >= j)
+				break;
+			sort_swap(base + i * size, base + j * size, size);
+		}
+		sort_swap(base, base + j * size, size);
+
+		// Recurse into the smaller side and loop on the larger, so stack depth stays logarithmic
+		// even when every partition is lopsided.
+		if(j < count - j - 1) {
+			sort_intro(base, j, size, compare, arg, depth);
+			base += (j + 1) * size;
+			count -= j + 1;
+		} else {
+			sort_intro(base + (j + 1) * size, count - j - 1, size, compare, arg, depth);
+			count = j;
+		}
+	}
+	sort_insertion(base, count, size, compare, arg);
+}
+
+} // namespace
+
 void qsort_r(void *base, size_t count, size_t size,
 		int (*compare)(const void *, const void *, void *),
 		void *arg) {
-	// TODO: implement a faster sort
-	for(size_t i = 0; i < count; i++) {
-		void *u = (void *)((uintptr_t)base + i * size);
-		for(size_t j = i + 1; j < count; j++) {
-			void *v = (void *)((uintptr_t)base + j * size);
-			if(compare(u, v, arg) <= 0)
-				continue;
-
-			// swap u and v
-			char *u_bytes = (char *)u;
-			char *v_bytes = (char *)v;
-			for(size_t k = 0; k < size; k++) {
-				char temp = u_bytes[k];
-				u_bytes[k] = v_bytes[k];
-				v_bytes[k] = temp;
-			}
-		}
-	}
+	if(count < 2 || !size)
+		return;
+	unsigned lg = 0;
+	for(size_t n = count; n > 1; n >>= 1)
+		lg++;
+	sort_intro(reinterpret_cast<char *>(base), count, size, compare, arg, 2 * lg);
 }
+// MLIBC_QSORT_END
 
 int abs(int num) {
 	return num < 0 ? -num : num;
@@ -531,11 +641,16 @@ int posix_memalign(void **out, size_t align, size_t size) {
 		return EINVAL;
 	if(align & (align - 1)) // Make sure that align is a power of two.
 		return EINVAL;
+#if MLIBC_RT_ALLOCATOR
+	// Ask for the alignment outright rather than inferring it from the request size: the runtime
+	// allocator makes no natural-alignment promise, so the old "allocate max(align,size) and hope"
+	// contract does not hold.
+	auto p = getAllocator().allocate_aligned(size, align);
+#else
 	auto p = getAllocator().allocate(frg::max(align, size));
+#endif
 	if(!p)
 		return ENOMEM;
-	// Hope that the alignment was respected. This works on the current allocator.
-	// TODO: Make the allocator alignment-aware.
 	__ensure(!(reinterpret_cast<uintptr_t>(p) & (align - 1)));
 	*out = p;
 	return 0;

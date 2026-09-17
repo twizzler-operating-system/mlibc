@@ -13,6 +13,9 @@ option('bsd_option', type: 'feature', value : 'auto')
 option('libgcc_dependency', type : 'boolean', value : true)
 option('linux_kernel_headers', type: 'string', value : '')
 option('default_library_paths', type: 'array', value: [])
+option('rt_allocator', type : 'boolean', value : false,
+	description : 'route the libc heap to the Twizzler runtime allocator (twz_rt_malloc) instead of frigg slab_pool')
+
 option('debug_allocator', type : 'boolean', value : false,
 	description : 'Enable the debug allocator, which uses mmap for every allocation and adds guard pages for each allocation')
 option('use_freestnd_hdrs', type : 'feature', value : 'auto',

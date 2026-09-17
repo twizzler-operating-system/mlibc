@@ -1,5 +1,6 @@
 
 #include <string.h>
+#include <stdint.h>
 
 #include <bits/ensure.h>
 #include <frg/eternal.hpp>
@@ -7,7 +8,112 @@
 #include <mlibc/internal-sysdeps.hpp>
 #include <internal-config.h>
 
-#if !MLIBC_DEBUG_ALLOCATOR
+#if MLIBC_RT_ALLOCATOR
+
+extern "C" {
+void *twz_rt_malloc(size_t sz, size_t align, uint32_t flags);
+void twz_rt_dealloc(void *ptr, size_t sz, size_t align, uint32_t flags);
+}
+
+namespace {
+
+// Immediately precedes every pointer handed out. `base`/`total` are what the runtime must be given
+// back verbatim: twz_rt_dealloc is a SIZED free, and the runtime routes on the pointer it issued,
+// so neither value can be reconstructed from the user pointer once alignment padding is involved.
+struct RtHeader {
+	void *base;
+	size_t total;
+};
+
+constexpr size_t kHeader = sizeof(RtHeader);
+// Every pointer libc hands out must suit max_align_t.
+constexpr size_t kMinAlign = 16;
+
+void *rt_alloc_impl(size_t size, size_t align) {
+	if(align < kMinAlign)
+		align = kMinAlign;
+	if(!size)
+		size = 1;
+	// The alignment slack is only needed when the caller wants more than the runtime already
+	// guarantees. Paying it unconditionally cost ~2x footprint on every allocation under 4 KiB and
+	// turned this experiment into a 29.5% fault REGRESSION -- the runtime's own shard extension
+	// then had to touch twice the pages. A twz_rt_malloc of kMinAlign is already 16-aligned, so a
+	// header-sized offset from it stays 16-aligned with no rounding at all.
+	size_t total = (align <= kMinAlign) ? (size + kHeader) : (size + align + kHeader);
+	void *base = twz_rt_malloc(total, kMinAlign, 0);
+	if(!base)
+		return nullptr;
+	uintptr_t raw = reinterpret_cast<uintptr_t>(base) + kHeader;
+	uintptr_t user = (align <= kMinAlign) ? raw : ((raw + (align - 1)) & ~(align - 1));
+	auto *hdr = reinterpret_cast<RtHeader *>(user - kHeader);
+	hdr->base = base;
+	hdr->total = total;
+	return reinterpret_cast<void *>(user);
+}
+
+size_t rt_usable(void *ptr) {
+	auto *hdr = reinterpret_cast<RtHeader *>(reinterpret_cast<uintptr_t>(ptr) - kHeader);
+	uintptr_t off = reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(hdr->base);
+	return hdr->total - off;
+}
+
+} // namespace
+
+void *MemoryAllocator::allocate(size_t size) {
+	// frigg returned naturally-aligned blocks, and posix_memalign leans on that by asking for
+	// max(align, size). Match it so that contract still holds without a header-shifted pointer
+	// breaking the alignment: give a request of N at least the alignment of the largest power of
+	// two <= N, capped at a page.
+	// Plain allocations need only max_align_t. The natural-alignment contract frigg happened to
+	// provide is now supplied explicitly by allocate_aligned, and posix_memalign/aligned_alloc are
+	// its only consumers -- every other getAllocator().allocate() caller in mlibc is a byte buffer.
+	return rt_alloc_impl(size, kMinAlign);
+}
+
+void *MemoryAllocator::allocate_aligned(size_t size, size_t align) {
+	return rt_alloc_impl(size, align);
+}
+
+void MemoryAllocator::free(void *ptr) {
+	if(!ptr)
+		return;
+	auto *hdr = reinterpret_cast<RtHeader *>(reinterpret_cast<uintptr_t>(ptr) - kHeader);
+	twz_rt_dealloc(hdr->base, hdr->total, kMinAlign, 0);
+}
+
+void MemoryAllocator::deallocate(void *ptr, size_t) {
+	free(ptr);
+}
+
+void *MemoryAllocator::reallocate(void *ptr, size_t size) {
+	if(!size) {
+		free(ptr);
+		return nullptr;
+	}
+	if(!ptr)
+		return allocate(size);
+	size_t old = rt_usable(ptr);
+	// Not twz_rt_realloc: that would move the runtime's block, but the user pointer is offset from
+	// it by alignment padding, so the header would no longer sit where free() looks for it.
+	void *out = allocate(size);
+	if(!out)
+		return nullptr;
+	memcpy(out, ptr, old < size ? old : size);
+	free(ptr);
+	return out;
+}
+
+size_t MemoryAllocator::get_size(void *ptr) {
+	return rt_usable(ptr);
+}
+
+MemoryAllocator &getAllocator() {
+	// frg::eternal for the same reason as the other variants: __cxa_atexit() calls this.
+	static frg::eternal<MemoryAllocator> singleton{};
+	return singleton.get();
+}
+
+#elif !MLIBC_DEBUG_ALLOCATOR
 
 // --------------------------------------------------------
 // Globals

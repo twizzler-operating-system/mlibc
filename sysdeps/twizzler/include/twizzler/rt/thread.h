@@ -117,6 +117,40 @@ struct thread_info {
 const thread_id TWZ_RT_THREAD_ID_SELF = (thread_id)0xFFFFFFFF;
 extern struct thread_info twz_rt_get_thread_info(thread_id id);
 
+/// Post a signal to another thread of this compartment.
+///
+/// The signal is delivered to that thread specifically -- its handler runs there, not on the
+/// caller -- and a target parked in a blocking wait is woken so it reaches a delivery point
+/// promptly. Delivery is asynchronous: this returns once the signal is posted, not once the
+/// handler has run. A thread inside a cross-compartment call does not take delivery until it
+/// returns to its own security context.
+///
+/// `signal` is a signal number in 1..64. Pending signals coalesce: two posts of the same number
+/// before delivery are one delivery, so this cannot express queued realtime signals.
+///
+/// Waking the target is not by itself enough to make its blocking call return `EINTR` -- see
+/// twz_rt_interrupt_bump, which the layer owning the handler table calls when POSIX says the
+/// call should be interrupted rather than restarted.
+extern twz_error twz_rt_thread_signal(thread_id id, uint64_t signal);
+
+/// Stack bounds of a thread.
+struct stack_bounds {
+  /// Lowest valid address of the stack. 0 if unknown.
+  uintptr_t start;
+  /// Length of the stack in bytes. 0 if unknown.
+  size_t len;
+};
+
+/// Get the calling thread's stack bounds.
+///
+/// Thread stacks here are runtime allocations, not OS-visible mappings, so this is the only way
+/// to learn them. A runtime that does not know this thread's bounds -- a compartment's main
+/// thread, whose stack the monitor built, or a runtime that does not track stacks at all --
+/// returns {0, 0}, which means "unknown", never "empty": callers must fall back to whatever they
+/// did without bounds. Spawned-thread stacks are heap allocations with no guard page below
+/// `start`, so a caller pacing recursion against these bounds must keep its own red zone.
+extern struct stack_bounds twz_rt_get_stack_bounds(void);
+
 #ifdef __cplusplus
 }
 #endif

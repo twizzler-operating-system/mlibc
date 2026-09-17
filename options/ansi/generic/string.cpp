@@ -3,9 +3,20 @@
 #include <string.h>
 #include <errno.h>
 #include <wchar.h>
+#include <stdint.h>
 
 #include <bits/ensure.h>
 #include <mlibc/strtol.hpp>
+
+namespace {
+	// SWAR helpers for the scan/compare family below. Little-endian only (x86_64 + aarch64 are
+	// both LE), so the lowest matching byte is the lowest set bit of the mask.
+	constexpr uint64_t kOnes = 0x0101010101010101ull;
+	constexpr uint64_t kHighs = 0x8080808080808080ull;
+	// Nonzero iff w contains a zero byte; that byte's 0x80 bit is set (lowest zero = lowest bit).
+	[[gnu::always_inline]] inline uint64_t haszero(uint64_t w) { return (w - kOnes) & ~w & kHighs; }
+	[[gnu::always_inline]] inline uint64_t bcast(unsigned char b) { return static_cast<uint64_t>(b) * kOnes; }
+}
 
 // memset() is defined in options/internals.
 // memcpy() is defined in options/internals.
@@ -53,29 +64,54 @@ char *strncat(char *__restrict dest, const char *__restrict src, size_t max_size
 }
 
 int memcmp(const void *a, const void *b, size_t size) {
-	for(size_t i = 0; i < size; i++) {
-		auto a_byte = static_cast<const unsigned char *>(a)[i];
-		auto b_byte = static_cast<const unsigned char *>(b)[i];
-		if(a_byte < b_byte)
-			return -1;
-		if(a_byte > b_byte)
-			return 1;
+	auto x = static_cast<const unsigned char *>(a);
+	auto y = static_cast<const unsigned char *>(b);
+	// Bounded: word loads only ever read within [ptr, ptr + size), so no over-read.
+	while(size >= 8) {
+		uint64_t wx, wy;
+		__builtin_memcpy(&wx, x, 8);
+		__builtin_memcpy(&wy, y, 8);
+		if(wx != wy) {
+			for(int i = 0; i < 8; i++)
+				if(x[i] != y[i])
+					return static_cast<int>(x[i]) - static_cast<int>(y[i]);
+		}
+		x += 8; y += 8; size -= 8;
+	}
+	while(size--) {
+		if(*x != *y)
+			return static_cast<int>(*x) - static_cast<int>(*y);
+		x++; y++;
 	}
 	return 0;
 }
 int strcmp(const char *a, const char *b) {
-	size_t i = 0;
-	while(true) {
-		unsigned char a_byte = a[i];
-		unsigned char b_byte = b[i];
-		if(!a_byte && !b_byte)
-			return 0;
-		// If only one char is null, one of the following cases applies.
-		if(a_byte < b_byte)
-			return -1;
-		if(a_byte > b_byte)
-			return 1;
-		i++;
+	auto x = reinterpret_cast<const unsigned char *>(a);
+	auto y = reinterpret_cast<const unsigned char *>(b);
+	// Word fast-path only when both share alignment, so the aligned reads stay page-safe on both;
+	// otherwise the byte loop, always correct and page-safe.
+	if((reinterpret_cast<uintptr_t>(x) & 7) == (reinterpret_cast<uintptr_t>(y) & 7)) {
+		while(reinterpret_cast<uintptr_t>(x) & 7) {
+			if(*x != *y || !*x)
+				return static_cast<int>(*x) - static_cast<int>(*y);
+			x++; y++;
+		}
+		for(;;) {
+			uint64_t wx, wy;
+			__builtin_memcpy(&wx, x, 8);
+			__builtin_memcpy(&wy, y, 8);
+			if(wx != wy || haszero(wx)) {
+				for(int i = 0; i < 8; i++)
+					if(x[i] != y[i] || !x[i])
+						return static_cast<int>(x[i]) - static_cast<int>(y[i]);
+			}
+			x += 8; y += 8;
+		}
+	}
+	for(;;) {
+		if(*x != *y || !*x)
+			return static_cast<int>(*x) - static_cast<int>(*y);
+		x++; y++;
 	}
 }
 
@@ -85,21 +121,32 @@ int strcoll(const char *a, const char *b) {
 }
 
 int strncmp(const char *a, const char *b, size_t max_size) {
-	size_t i = 0;
-	while(true) {
-		if(!(i < max_size))
-			return 0;
-		unsigned char a_byte = a[i];
-		unsigned char b_byte = b[i];
-		if(!a_byte && !b_byte)
-			return 0;
-		// If only one char is null, one of the following cases applies.
-		if(a_byte < b_byte)
-			return -1;
-		if(a_byte > b_byte)
-			return 1;
-		i++;
+	auto x = reinterpret_cast<const unsigned char *>(a);
+	auto y = reinterpret_cast<const unsigned char *>(b);
+	if((reinterpret_cast<uintptr_t>(x) & 7) == (reinterpret_cast<uintptr_t>(y) & 7)) {
+		while(max_size && (reinterpret_cast<uintptr_t>(x) & 7)) {
+			if(*x != *y || !*x)
+				return static_cast<int>(*x) - static_cast<int>(*y);
+			x++; y++; max_size--;
+		}
+		while(max_size >= 8) {
+			uint64_t wx, wy;
+			__builtin_memcpy(&wx, x, 8);
+			__builtin_memcpy(&wy, y, 8);
+			if(wx != wy || haszero(wx)) {
+				for(int i = 0; i < 8; i++)
+					if(x[i] != y[i] || !x[i])
+						return static_cast<int>(x[i]) - static_cast<int>(y[i]);
+			}
+			x += 8; y += 8; max_size -= 8;
+		}
 	}
+	while(max_size) {
+		if(*x != *y || !*x)
+			return static_cast<int>(*x) - static_cast<int>(*y);
+		x++; y++; max_size--;
+	}
+	return 0;
 }
 
 size_t strxfrm(char *__restrict dest, const char *__restrict src, size_t n) {
@@ -114,22 +161,49 @@ size_t strxfrm(char *__restrict dest, const char *__restrict src, size_t n) {
 }
 
 void *memchr(const void *s, int c, size_t size) {
-	auto s_bytes = static_cast<const unsigned char *>(s);
-	for(size_t i = 0; i < size; i++)
-		if(s_bytes[i] == static_cast<unsigned char>(c))
-			return const_cast<unsigned char *>(s_bytes + i);
+	auto p = static_cast<const unsigned char *>(s);
+	unsigned char b = static_cast<unsigned char>(c);
+	uint64_t rep = bcast(b);
+	// Bounded: word loads read only within [s, s + size).
+	while(size >= 8) {
+		uint64_t w;
+		__builtin_memcpy(&w, p, 8);
+		uint64_t z = haszero(w ^ rep);
+		if(z)
+			return const_cast<unsigned char *>(p + (__builtin_ctzll(z) >> 3));
+		p += 8; size -= 8;
+	}
+	while(size--) {
+		if(*p == b)
+			return const_cast<unsigned char *>(p);
+		p++;
+	}
 	return nullptr;
 }
 char *strchr(const char *s, int c) {
-	size_t i = 0;
-	while(s[i]) {
-		if(s[i] == c)
-			return const_cast<char *>(&s[i]);
-		i++;
+	auto p = reinterpret_cast<const unsigned char *>(s);
+	unsigned char b = static_cast<unsigned char>(c);
+	while(reinterpret_cast<uintptr_t>(p) & 7) {
+		if(*p == b)
+			return const_cast<char *>(reinterpret_cast<const char *>(p));
+		if(!*p)
+			return b == 0 ? const_cast<char *>(reinterpret_cast<const char *>(p)) : nullptr;
+		p++;
 	}
-	if(c == 0)
-		return const_cast<char *>(&s[i]);
-	return nullptr;
+	uint64_t rep = bcast(b);
+	for(;;) {
+		uint64_t w;
+		__builtin_memcpy(&w, p, 8);
+		if(haszero(w ^ rep) | haszero(w)) {
+			for(int i = 0; i < 8; i++) {
+				if(p[i] == b)
+					return const_cast<char *>(reinterpret_cast<const char *>(p + i));
+				if(!p[i])
+					return b == 0 ? const_cast<char *>(reinterpret_cast<const char *>(p + i)) : nullptr;
+			}
+		}
+		p += 8;
+	}
 }
 size_t strcspn(const char *s, const char *chrs) {
 	size_t n = 0;
@@ -149,13 +223,36 @@ char *strpbrk(const char *s, const char *chrs) {
 	return nullptr;
 }
 char *strrchr(const char *s, int c) {
-	// The null-terminator is considered to be part of the string.
-	size_t length = strlen(s);
-	for(size_t i = 0; i <= length; i++) {
-		if(s[length - i] == c)
-			return const_cast<char *>(s + (length - i));
+	// Forward SWAR scan tracking the last match; the terminator counts, so strrchr(s, 0) returns
+	// a pointer to it.
+	auto p = reinterpret_cast<const unsigned char *>(s);
+	unsigned char b = static_cast<unsigned char>(c);
+	const unsigned char *last = nullptr;
+	while(reinterpret_cast<uintptr_t>(p) & 7) {
+		if(*p == b)
+			last = p;
+		if(!*p)
+			return const_cast<char *>(reinterpret_cast<const char *>(b == 0 ? p : last));
+		p++;
 	}
-	return nullptr;
+	uint64_t rep = bcast(b);
+	for(;;) {
+		uint64_t w;
+		__builtin_memcpy(&w, p, 8);
+		if(haszero(w)) {
+			for(int i = 0; i < 8; i++) {
+				if(p[i] == b)
+					last = p + i;
+				if(!p[i])
+					return const_cast<char *>(reinterpret_cast<const char *>(b == 0 ? p + i : last));
+			}
+		}
+		if(haszero(w ^ rep)) {
+			for(int i = 7; i >= 0; i--)
+				if(p[i] == b) { last = p + i; break; }
+		}
+		p += 8;
+	}
 }
 size_t strspn(const char *s, const char *chrs) {
 	size_t n = 0;
@@ -166,21 +263,24 @@ size_t strspn(const char *s, const char *chrs) {
 	}
 }
 char *strstr(const char *s, const char *pattern) {
-	for(size_t i = 0; s[i]; i++) {
-		bool found = true;
-		for(size_t j = 0; pattern[j]; j++) {
-			if(!pattern[j] || s[i + j] == pattern[j])
-				continue;
-
-			found = false;
-			break;
-		}
-
-		if(found)
-			return const_cast<char *>(&s[i]);
+	if(!pattern[0])
+		return const_cast<char *>(s);
+	size_t pl = strlen(pattern);
+	// Skip to first-character candidates with the word-wise strchr, then verify with a bounded,
+	// NUL-stopping compare (never reads past the haystack terminator even on a partial match).
+	for(;;) {
+		s = strchr(s, pattern[0]);
+		if(!s)
+			return nullptr;
+		size_t i = 0;
+		while(i < pl && s[i] && s[i] == pattern[i])
+			i++;
+		if(i == pl)
+			return const_cast<char *>(s);
+		if(!s[i])
+			return nullptr;
+		s++;
 	}
-
-	return nullptr;
 }
 char *strtok_r(char *__restrict s, const char *__restrict del, char **__restrict m) {
 	__ensure(m);

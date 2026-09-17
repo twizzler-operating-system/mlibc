@@ -48,7 +48,12 @@ extern "C" void __mlibc_enter_thread(void *user_arg) {
 	
 	// Initialize the TCB for this thread
 	initBasicTcb(tcb);
-	
+
+	// On-thread, so this is the child's own id. Not done in initBasicTcb: the runtime also
+	// calls that from the *spawner* on the child's TCB, where gettid would record the wrong
+	// thread. Must be set before the futex_wake below, which is what creators wait on.
+	tcb->tid = mlibc::sys_futex_tid();
+
 	// Set the thread attributes that were passed from thread_create
 	tcb->returnValueType = args->returns_int ? TcbThreadReturnValue::Integer : TcbThreadReturnValue::Pointer;
 	tcb->isJoinable = args->is_joinable;

@@ -603,6 +603,10 @@ void *thread_key_get_with_tcb(Tcb* tcb, __mlibc_uintptr key) {
 	if (key >= PTHREAD_KEYS_MAX || !key_globals_[key].in_use)
 		return nullptr;
 
+	// No TSD array yet (thread not fully brought up, or already torn down): no value to read.
+	if (!tcb->localKeys)
+		return nullptr;
+
 	if (key_globals_[key].generation > (*tcb->localKeys)[key].generation) {
 		(*tcb->localKeys)[key].value = nullptr;
 		(*tcb->localKeys)[key].generation = key_globals_[key].generation;
@@ -618,6 +622,10 @@ void *thread_key_get(__mlibc_uintptr key) {
 	if (key >= PTHREAD_KEYS_MAX || !key_globals_[key].in_use)
 		return nullptr;
 
+	// No TSD array yet (thread not fully brought up, or already torn down): no value to read.
+	if (!self->localKeys)
+		return nullptr;
+
 	if (key_globals_[key].generation > (*self->localKeys)[key].generation) {
 		(*self->localKeys)[key].value = nullptr;
 		(*self->localKeys)[key].generation = key_globals_[key].generation;
@@ -628,8 +636,16 @@ void *thread_key_get(__mlibc_uintptr key) {
 
 int thread_key_set(__mlibc_uintptr key, const void *value) {
 	auto self = mlibc::get_current_tcb();
+
+	// Lazily create the TSD array if `initBasicTcb` has not run for this thread yet: a thread can
+	// reach `pthread_setspecific` before the spawner finishes bringing it up (its TLS is installed
+	// but `localKeys` is still null -- an early-startup race that otherwise null-derefs here).
+	// Done off the key lock; `localKeys` is per-thread, so only this thread touches it.
+	if (!self->localKeys)
+		self->localKeys = frg::construct<frg::array<Tcb::LocalKey, PTHREAD_KEYS_MAX>>(getAllocator());
+
 	auto g = frg::guard(&key_mutex_);
-	
+
 	if (key >= PTHREAD_KEYS_MAX || !key_globals_[key].in_use)
 		return EINVAL;
 
