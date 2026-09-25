@@ -3261,12 +3261,16 @@ int sys_sysconf(int num, long *ret) {
         case _SC_THREAD_DESTRUCTOR_ITERATIONS:
             *ret = PTHREAD_DESTRUCTOR_ITERATIONS;
             break;
-        // Memory. There is no per-compartment memory accounting exposed, so report unknown
-        // rather than a fabricated size.
+        // Machine-wide, in _SC_PAGESIZE units; there is no per-compartment accounting. Unknown
+        // (-1) made callers such as ggml's fit probe fail after a long search.
         case _SC_PHYS_PAGES:
-        case _SC_AVPHYS_PAGES:
-            *ret = -1;
+        case _SC_AVPHYS_PAGES: {
+            struct memory_info mem = twz_rt_get_memory_info();
+            size_t page_size = cached_sysinfo().page_size;
+            size_t pages = num == _SC_PHYS_PAGES ? mem.total_pages : mem.free_pages;
+            *ret = page_size ? (long)(pages * mem.page_size / page_size) : -1;
             break;
+        }
         // Option queries. Answer honestly: -1 means "not supported", and a positive value
         // means supported. Getting these wrong makes callers take unsupported code paths.
         case _SC_VERSION:

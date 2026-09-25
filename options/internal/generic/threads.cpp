@@ -479,9 +479,19 @@ int thread_cond_init(struct __mlibc_cond *__restrict cond, const struct __mlibc_
 	cond->__mlibc_clock = clock;
 	cond->__mlibc_flags = pshared;
 
-	__atomic_store_n(&cond->__mlibc_seq, 1, __ATOMIC_RELAXED);
+	__atomic_store_n(&cond->__mlibc_seq, 0, __ATOMIC_RELAXED);
 
 	return 0;
+}
+
+// __mlibc_seq counts broadcasts in steps of 2; bit 0 means a waiter may be asleep on the word.
+// A waiter sets it (holding the mutex) before sleeping on the value with the bit set; a broadcast
+// clears it as it bumps the count and wakes only if it was set. A waiter that loses that race
+// sees the value change and does not sleep, so skipping the wake loses nothing.
+static constexpr unsigned int cond_waiters_bit = 1;
+
+static bool cond_seq_changed(unsigned int now, unsigned int seq) {
+	return (now & ~cond_waiters_bit) != (seq & ~cond_waiters_bit);
 }
 
 int thread_cond_destroy(struct __mlibc_cond *) {
@@ -489,7 +499,12 @@ int thread_cond_destroy(struct __mlibc_cond *) {
 }
 
 int thread_cond_broadcast(struct __mlibc_cond *cond) {
-	__atomic_fetch_add(&cond->__mlibc_seq, 1, __ATOMIC_RELEASE);
+	auto old = __atomic_load_n(&cond->__mlibc_seq, __ATOMIC_RELAXED);
+	while (!__atomic_compare_exchange_n(&cond->__mlibc_seq, &old,
+			(old + 2) & ~cond_waiters_bit, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+		;
+	if (!(old & cond_waiters_bit))
+		return 0;
 	if(int e = mlibc::sys_futex_wake((int *)&cond->__mlibc_seq); e)
 		__ensure(!"sys_futex_wake() failed");
 
@@ -509,6 +524,19 @@ int thread_cond_timedwait(struct __mlibc_cond *__restrict cond, __mlibc_mutex *_
 
 	// TODO: handle locking errors and cancellation properly.
 	while (true) {
+		// Still holding the mutex: publish that we may sleep before anyone can signal.
+		while (!(seq & cond_waiters_bit)) {
+			auto cur = seq;
+			if (__atomic_compare_exchange_n(&cond->__mlibc_seq, &cur, seq | cond_waiters_bit,
+					false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+				seq |= cond_waiters_bit;
+			} else if (cond_seq_changed(cur, seq)) {
+				return 0;
+			} else {
+				seq = cur;
+			}
+		}
+
 		if (thread_mutex_unlock(mutex))
 			__ensure(!"Failed to unlock the mutex");
 
@@ -544,13 +572,11 @@ int thread_cond_timedwait(struct __mlibc_cond *__restrict cond, __mlibc_mutex *_
 		//      whether to go to sleep again or to return 0, but we do the former
 		//      to match other libcs.
 		//   4. e == ETIMEDOUT: this should only happen if abstime is set.
-		if (e == 0) {
+		if (e == 0 || e == EAGAIN) {
 			auto cur_seq = __atomic_load_n(&cond->__mlibc_seq, __ATOMIC_ACQUIRE);
-			if (cur_seq > seq)
+			if (cond_seq_changed(cur_seq, seq))
 				return 0;
-		} else if (e == EAGAIN) {
-			__ensure(__atomic_load_n(&cond->__mlibc_seq, __ATOMIC_ACQUIRE) > seq);
-			return 0;
+			seq = cur_seq;
 		} else if (e == EINTR) {
 			continue;
 		} else if (e == ETIMEDOUT) {
