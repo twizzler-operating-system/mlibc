@@ -74,6 +74,10 @@ typedef uint32_t object_cmd;
 const object_cmd OBJECT_CMD_DELETE = 1;
 const object_cmd OBJECT_CMD_SYNC = 2;
 const object_cmd OBJECT_CMD_UPDATE = 3;
+/// Fetch this object's pages up front instead of on demand. The data argument is ignored. The
+/// runtime sizes the request from the object's recorded length, so a small object does not pay
+/// for a whole-object request; an object with no recorded length falls back to its whole extent.
+const object_cmd OBJECT_CMD_PRELOAD = 4;
 
 struct sync_info {
     uint64_t release_compare;

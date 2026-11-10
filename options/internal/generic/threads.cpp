@@ -182,6 +182,34 @@ __attribute__ ((__noreturn__)) void do_exit() {
 	__builtin_unreachable();
 }
 
+// One lock per scan, not per key: taking it for each of the PTHREAD_KEYS_MAX slots in every
+// iteration was ~8k lock/unlock pairs per thread exit, half the cost of a spawn+join.
+void run_key_dtors(Tcb *tcb) {
+	if (!tcb->localKeys)
+		return;
+	for (size_t j = 0; j < __MLIBC_THREAD_DESTRUCTOR_ITERATIONS; j++) {
+		bool ran = false;
+		key_mutex_.lock();
+		for (size_t i = 0; i < PTHREAD_KEYS_MAX; i++) {
+			auto &local = (*tcb->localKeys)[i];
+			if (!key_globals_[i].in_use || key_globals_[i].generation > local.generation)
+				continue;
+			auto v = local.value;
+			auto dtor = key_globals_[i].dtor;
+			if (!v || !dtor)
+				continue;
+			local.value = nullptr;
+			key_mutex_.unlock();
+			dtor(v);
+			ran = true;
+			key_mutex_.lock();
+		}
+		key_mutex_.unlock();
+		if (!ran)
+			break;
+	}
+}
+
 } // namespace
 
 __attribute__ ((__noreturn__)) void thread_exit(thread_exit_return ret_val) {
@@ -200,20 +228,7 @@ __attribute__ ((__noreturn__)) void thread_exit(thread_exit_return ret_val) {
 		frg::destruct(getAllocator(), old);
 	}
 
-	for (size_t j = 0; j < __MLIBC_THREAD_DESTRUCTOR_ITERATIONS; j++) {
-		for (size_t i = 0; i < PTHREAD_KEYS_MAX; i++) {
-			if (auto v = thread_key_get(i)) {
-				key_mutex_.lock();
-				auto dtor = key_globals_[i].dtor;
-				key_mutex_.unlock();
-
-				if (dtor) {
-					dtor(v);
-					(*self->localKeys)[i].value = nullptr;
-				}
-			}
-		}
-	}
+	run_key_dtors(self);
 
 	if(self->returnValueType == TcbThreadReturnValue::Pointer)
 		self->returnValue.voidPtr = ret_val.voidPtr;
@@ -245,19 +260,7 @@ void run_dtors_for_tcb(Tcb *tcb, int ret_int) {
 		hand = hand->prev;
 		frg::destruct(getAllocator(), old);
 	}
-    for (size_t j = 0; j < __MLIBC_THREAD_DESTRUCTOR_ITERATIONS; j++) {
-        for (size_t i = 0; i < PTHREAD_KEYS_MAX; i++) {
-			if (auto v = thread_key_get_with_tcb(tcb, i)) {
-				key_mutex_.lock();
-				auto dtor = key_globals_[i].dtor;
-				key_mutex_.unlock();
-				if (dtor) {
-					dtor(v);
-					(*tcb->localKeys)[i].value = nullptr;
-				}
-			}
-        }
-    }
+	run_key_dtors(tcb);
 	if(tcb->returnValueType == TcbThreadReturnValue::Pointer)
 		tcb->returnValue.voidPtr = ret_val.voidPtr;
 	else if(tcb->returnValueType == TcbThreadReturnValue::Integer)

@@ -68,6 +68,10 @@ enum open_kind {
   OpenKind_PtyClient,
   OpenKind_Compartment,
   OpenKind_Kqueue,
+  // A connected pair of stream endpoints (what socketpair(AF_UNIX, SOCK_STREAM) hands out).
+  // Opened with no bind info it creates the pair and returns one end; opened with a bare
+  // descriptor naming that end as the bind info, it returns the other.
+  OpenKind_SocketPair,
 };
 
 enum addr_kind {

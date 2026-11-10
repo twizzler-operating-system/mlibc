@@ -205,6 +205,14 @@ const mlibc::RtldConfig &__dlapi_get_config() {
 	return rtldConfig;
 }
 
+// The `errno` crate's unix backend links `errno_location` on any OS it has no arm for; mlibc
+// only names `__errno_location`. Exporting the alias is what lets the unmodified registry crate
+// work on this target.
+extern "C" [[ gnu::visibility("default") ]]
+int *errno_location() {
+	return __errno_location();
+}
+
 namespace mlibc {
 
 void sys_libc_log(const char *message) {
@@ -623,6 +631,7 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
 
 int sys_close(int fd) {
     SYSTRACE("sys_close(fd=%d)", fd);
+    if (fd < 0) return EBADF;
     fd_state_clear(fd);
     twz_rt_fd_close(fd);
     int result = 0;
@@ -1683,9 +1692,36 @@ static int sockaddr_to_twz_addr(const struct sockaddr *sa, socklen_t len,
 }
 
 int sys_socketpair(int domain, int type_and_flags, int proto, int *fds) {
-    // Only AF_INET/AF_INET6 exist here and neither can be paired; report the family, not a
-    // missing entry point, so callers probing for AF_UNIX get the errno they test for.
-    return EAFNOSUPPORT;
+    SYSTRACE("sys_socketpair(domain=%d, type=%d, proto=%d)", domain, type_and_flags, proto);
+    if (!fds) return EFAULT;
+    // AF_UNIX stream pairs only: the runtime backs them with a cross-wired pipe pair, which is
+    // what a socketpair is used for here (wakeup channels). There is no AF_UNIX transport
+    // beyond that, and AF_INET sockets cannot be paired.
+    if (domain != AF_UNIX) return EAFNOSUPPORT;
+    int nonblock = type_and_flags & SOCK_NONBLOCK;
+    int type = type_and_flags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (type != SOCK_STREAM) return EPROTOTYPE;
+
+    struct open_result a = twz_rt_fd_open(OpenKind_SocketPair, OPEN_FLAG_READ | OPEN_FLAG_WRITE,
+        NULL, 0);
+    if (a.err != SUCCESS) return twz_error_errno(a.err);
+
+    // The peer is named by the first end's descriptor, passed bare like accept's listener.
+    struct open_result b = twz_rt_fd_open(OpenKind_SocketPair, OPEN_FLAG_READ | OPEN_FLAG_WRITE,
+        &a.fd, sizeof(a.fd));
+    if (b.err != SUCCESS) {
+        twz_rt_fd_close(a.fd);
+        return twz_error_errno(b.err);
+    }
+
+    if (nonblock) {
+        io_flags flags = IO_NONBLOCKING;
+        twz_rt_fd_set_config(a.fd, IO_REGISTER_IO_FLAGS, &flags, sizeof(flags));
+        twz_rt_fd_set_config(b.fd, IO_REGISTER_IO_FLAGS, &flags, sizeof(flags));
+    }
+    fds[0] = a.fd;
+    fds[1] = b.fd;
+    return 0;
 }
 
 int sys_socket(int domain, int type, int protocol, int *fd) {

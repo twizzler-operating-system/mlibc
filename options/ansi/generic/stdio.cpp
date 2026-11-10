@@ -153,27 +153,45 @@ private:
 	frg::va_struct *_vsp;
 };
 
+// Batches output so an unbuffered stream sees one write per chunk rather than one per character.
 struct StreamPrinter {
 	StreamPrinter(FILE *stream)
-	: stream(stream), count(0) { }
+	: stream(stream), count(0), used(0) { }
 
 	void append(char c) {
-		fwrite_unlocked(&c, 1, 1, stream);
+		if(used == sizeof(buf))
+			flush();
+		buf[used++] = c;
 		count++;
 	}
 
 	void append(const char *str) {
-		fwrite_unlocked(str, strlen(str), 1, stream);
-		count += strlen(str);
+		append(str, strlen(str));
 	}
 
 	void append(const char *str, size_t n) {
-		fwrite_unlocked(str, n, 1, stream);
 		count += n;
+		if(used + n > sizeof(buf)) {
+			flush();
+			if(n > sizeof(buf)) {
+				fwrite_unlocked(str, n, 1, stream);
+				return;
+			}
+		}
+		memcpy(buf + used, str, n);
+		used += n;
+	}
+
+	void flush() {
+		if(used)
+			fwrite_unlocked(buf, used, 1, stream);
+		used = 0;
 	}
 
 	FILE *stream;
 	size_t count;
+	size_t used;
+	char buf[256];
 };
 
 struct BufferPrinter {
@@ -1196,6 +1214,7 @@ int vfprintf(FILE *__restrict stream, const char *__restrict format, __builtin_v
 	StreamPrinter p{stream};
 //	mlibc::infoLogger() << "printf(" << format << ")" << frg::endlog;
 	auto res = frg::printf_format<NL_ARGMAX>(PrintfAgent{&p, &vs}, format, &vs);
+	p.flush();
 	if (!res) {
 		errno = EINVAL;
 		return -1;

@@ -1,7 +1,9 @@
 .section .text
 .global _start
 _start:
-	adr x1, main
+	// adrp: `adr` reaches only +-1 MiB, which a large executable's `main` is outside of.
+	adrp x1, main
+	add x1, x1, :lo12:main
 
 	bl __mlibc_entry
 	brk #0

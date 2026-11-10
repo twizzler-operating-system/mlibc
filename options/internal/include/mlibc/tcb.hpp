@@ -92,7 +92,9 @@ struct Tcb {
 	void **dtvPointers;
 	int tid;
 	int didExit;
-#if defined(__x86_64__)
+	// Twizzler's runtime overlays this struct with its own Tcb<RuntimeThreadControl>, one layout
+	// for every arch, so aarch64 keeps x86_64's padding (stackCanary at 0x28).
+#if defined(__x86_64__) || (defined(__aarch64__) && defined(__Twizzler__))
 	uint8_t padding[8];
 #endif
 	uintptr_t stackCanary;
@@ -165,6 +167,11 @@ static_assert(offsetof(Tcb, stackCanary) == 0x14);
 // sysdeps/linux/x86/cp_syscall.S uses the offset of cancelBits.
 // It differs from x86_64 for the same reasons as the stack canary.
 static_assert(offsetof(Tcb, cancelBits) == 0x18);
+#elif defined(__aarch64__) && defined(__Twizzler__)
+// The thread pointer on AArch64 points to 16 bytes before the end of the TCB. dynlink
+// (src/lib/dynlink/src/arch/aarch64.rs, TCB_BELOW_TP) hardcodes sizeof(Tcb) - TP_TCB_OFFSET.
+static_assert(sizeof(Tcb) - TP_TCB_OFFSET == 128);
+static_assert(offsetof(Tcb, stackCanary) == 0x28);
 #elif defined(__aarch64__)
 // The thread pointer on AArch64 points to 16 bytes before the end of the TCB.
 // options/linker/aarch64/runtime.S uses the offset of dtvPointers.
